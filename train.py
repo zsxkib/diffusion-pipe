@@ -45,4 +45,7 @@ if __name__ == '__main__':
     # quit()
 
     batch_size = config.get('batch_size', 1)
-    dataset = dataset.Dataset(config['dataset'], batch_size, model)
+    dataset = dataset.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=2)
+
+    for item in dataset:
+        print(item['latents'].size())

@@ -82,16 +82,20 @@ def process_image_fn(vae):
         pil_img = crop_and_resize(pil_img)
         latents = encode_pil_to_latents(pil_img, vae)
 
-        example['latents'] = latents
+        example['latents'] = latents.squeeze(0)
         return example
     return fn
 
 
+# Dataset that does caching, batching, and dividing batches across data parallel ranks.
+# Logically represents a single folder of images and captions on disk.
 class Dataset:
-    def __init__(self, dataset_config, batch_size, model):
+    def __init__(self, dataset_config, model, data_parallel_rank, data_parallel_world_size, batch_size):
         self.config = dataset_config
-        self.batch_size = batch_size
         self.model = model
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_world_size = data_parallel_world_size
+        self.batch_size = batch_size
         self.path = Path(self.config['path'])
         self.cache_dir = self.path / 'cache'
         with common.zero_first():
@@ -115,9 +119,13 @@ class Dataset:
 
     def _get_text_embedding_map_fn(self, i):
         def fn(example):
-            example[f'text_embedding_{i}'] = self.model.get_text_embedding(i, example['caption'])
+            example[f'text_embedding'] = self.model.get_text_embedding(i, example['caption']).squeeze(0)
             return example
         return fn
+
+    def _make_divisible_by(self, n):
+        self.length = self.num_examples // n
+        self.num_examples = self.length * n
 
     def _init(self):
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -144,16 +152,34 @@ class Dataset:
         vae = self.model.get_vae()
         vae.to('cuda')
         with torch.no_grad():
-            latent_dataset = self._map_and_cache(dataset, process_image_fn(vae), cache_file_prefix='latent_')
+            self.latent_dataset = self._map_and_cache(dataset, process_image_fn(vae), cache_file_prefix='latent_')
         vae.to('cpu')
 
-        text_embedding_datasets = []
+        self.text_embedding_datasets = []
         for i, text_encoder in enumerate(self.model.get_text_encoders()):
             text_encoder.to('cuda')
             with torch.no_grad():
-                text_embedding_datasets.append(self._map_and_cache(dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
+                self.text_embedding_datasets.append(self._map_and_cache(dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
             text_encoder.to('cpu')
+        self.num_examples = len(self.latent_dataset)
+        for ds in self.text_embedding_datasets:
+            assert len(ds) == self.num_examples
+        self._make_divisible_by(self.data_parallel_world_size * self.batch_size)
 
-        print(latent_dataset[0])
-        print(text_embedding_datasets[0][0])
-        print(text_embedding_datasets[1][0])
+    def __getitem__(self, i):
+        if i >= len(self):
+            return IndexError('Dataset index out of range')
+        idx = (i * self.data_parallel_world_size + self.data_parallel_rank) * self.batch_size
+        selector = slice(idx, idx + self.batch_size)
+        d = {}
+        d['latents'] = self.latent_dataset[selector]['latents']
+        for te_idx, te_dataset in enumerate(self.text_embedding_datasets):
+            d[f'text_embedding_{te_idx+1}'] = te_dataset[selector]['text_embedding']
+        return d
+
+    def __len__(self):
+        return self.length
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
