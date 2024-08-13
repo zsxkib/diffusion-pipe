@@ -7,3 +7,4 @@ git+https://github.com/huggingface/datasets
 pillow
 sentencepiece
 protobuf
+peft

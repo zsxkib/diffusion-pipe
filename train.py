@@ -1,10 +1,14 @@
 import argparse
+import os
+from datetime import datetime, timezone
+import shutil
+import glob
 
 import toml
 import deepspeed
 
 from utils import dataset as dataset_util
-from utils import common
+from utils.common import is_main_process, DTYPE_MAP
 from models import flux
 
 parser = argparse.ArgumentParser()
@@ -17,13 +21,26 @@ args = parser.parse_args()
 
 
 def set_config_defaults(config):
-    config['model']['dtype'] = common.DTYPE_MAP[config['model']['dtype']]
+    config['model']['dtype'] = DTYPE_MAP[config['model']['dtype']]
+    if 'lora' in config:
+        lora_config = config['lora']
+        lora_config.setdefault('alpha', lora_config['rank'])
+        lora_config.setdefault('dropout', 0.0)
+
+
+def get_most_recent_run_dir(output_dir):
+    return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
 
 
 if __name__ == '__main__':
     with open(args.config) as f:
         config = toml.load(f)
     set_config_defaults(config)
+
+    resume_from_checkpoint = (
+        args.resume_from_checkpoint if args.resume_from_checkpoint is not None
+        else config.get('resume_from_checkpoint', False)
+    )
 
     deepspeed.init_distributed()
 
@@ -44,12 +61,19 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
+    model.inject_lora_layers(config['lora'])
+    quit()
+
     batch_size = config.get('batch_size', 1)
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
-    dataset = dataset_util.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=batch_size*gradient_accumulation_steps)
-    dataloader = dataset_util.PipelineDataLoader(dataset, gradient_accumulation_steps)
+    train_data = dataset_util.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=batch_size*gradient_accumulation_steps)
 
-    for _ in range(10):
-        micro_batch = next(dataloader)
-        print(micro_batch[0].size())
-        print(f'Epoch: {dataloader.epoch}')
+    # if this is a new run, create a new dir for it
+    if not resume_from_checkpoint and is_main_process():
+        run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+        os.makedirs(run_dir, exist_ok=True)
+        shutil.copy(args.config, run_dir)
+        shutil.copy(args.deepspeed_config, run_dir)
+    # wait for all processes then get the most recent dir (may have just been created)
+    deepspeed.comm.barrier()
+    run_dir = get_most_recent_run_dir(config['output_dir'])
