@@ -3,7 +3,7 @@ import argparse
 import toml
 import deepspeed
 
-from utils import dataset
+from utils import dataset as dataset_util
 from utils import common
 from models import flux
 
@@ -45,7 +45,11 @@ if __name__ == '__main__':
     # quit()
 
     batch_size = config.get('batch_size', 1)
-    dataset = dataset.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=2)
+    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+    dataset = dataset_util.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=batch_size*gradient_accumulation_steps)
+    dataloader = dataset_util.PipelineDataLoader(dataset, gradient_accumulation_steps)
 
-    for item in dataset:
-        print(item['latents'].size())
+    for _ in range(10):
+        micro_batch = next(dataloader)
+        print(micro_batch[0].size())
+        print(f'Epoch: {dataloader.epoch}')

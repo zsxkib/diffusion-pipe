@@ -5,6 +5,7 @@ import random
 import torch
 from torchvision import transforms
 from deepspeed.utils.logging import logger
+from deepspeed import comm as dist
 import datasets
 from PIL import Image, ImageOps
 from datasets.fingerprint import Hasher
@@ -183,3 +184,74 @@ class Dataset:
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
+
+
+def split_batch(batch, pieces):
+    # batch is a tuple of tensors
+    split_size = batch[0].size(0) // pieces
+    micro_batches = zip(*(torch.split(tensor, split_size) for tensor in batch))
+    return micro_batches
+
+
+# DataLoader that divides batches into microbatches for gradient accumulation steps when doing
+# pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
+class PipelineDataLoader:
+    def __init__(self, dataset, gradient_accumulation_steps):
+        self.dataset = dataset
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.reset()
+
+    def reset(self):
+        self.epoch = 1
+        self.num_batches_pulled = 0
+        self._create_dataloader()
+
+    def __iter__(self):
+        return self
+
+    def __len__(self):
+        return len(self.dataset) * self.gradient_accumulation_steps
+
+    def __next__(self):
+        try:
+            micro_batch = next(self.data)
+        except StopIteration:
+            self._create_dataloader()
+            micro_batch = next(self.data)
+            self.epoch += 1
+        return micro_batch
+
+    def _create_dataloader(self):
+        def collate_fn(x):
+            ret = []
+            ret.append(x['latents'])
+            for key in sorted(x.keys()):
+                if 'text_embedding' in key:
+                    ret.append(x[key])
+            return tuple(ret)
+        self.dataloader = torch.utils.data.DataLoader(
+            self.dataset,
+            pin_memory=True,
+            batch_size=None,
+            collate_fn=collate_fn
+        )
+        self.data = self._pull_batches_from_dataloader()
+        self.num_batches_pulled = 0
+
+    def _pull_batches_from_dataloader(self):
+        for batch in self.dataloader:
+            self.num_batches_pulled += 1
+            for micro_batch in split_batch(batch, self.gradient_accumulation_steps):
+                yield micro_batch
+
+    # Only the first and last stages in the pipeline pull from the dataloader. Parts of the code need
+    # to know the epoch, so we synchronize the epoch so the processes that don't use the dataloader
+    # know the current epoch.
+    def sync_epoch(self):
+        process_group = dist.get_world_group()
+        result = [None] * dist.get_world_size(process_group)
+        torch.distributed.all_gather_object(result, self.epoch, group=process_group)
+        max_epoch = -1
+        for epoch in result:
+            max_epoch = max(epoch, max_epoch)
+        self.epoch = max_epoch
