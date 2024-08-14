@@ -21,7 +21,10 @@ args = parser.parse_args()
 
 
 def set_config_defaults(config):
-    config['model']['dtype'] = DTYPE_MAP[config['model']['dtype']]
+    model_config = config['model']
+    model_config['dtype'] = DTYPE_MAP[model_config['dtype']]
+    model_config.setdefault('guidance', 1.0)
+
     if 'lora' in config:
         lora_config = config['lora']
         lora_config.setdefault('alpha', lora_config['rank'])
@@ -51,6 +54,7 @@ if __name__ == '__main__':
         model = flux.CustomFluxPipeline.from_pretrained(model_config['path'], torch_dtype=model_config['dtype'])
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
+    model.model_config = model_config
 
     # import sys, PIL
     # test_image = sys.argv[1]
@@ -62,11 +66,16 @@ if __name__ == '__main__':
     # quit()
 
     model.inject_lora_layers(config['lora'])
-    quit()
 
     batch_size = config.get('batch_size', 1)
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
     train_data = dataset_util.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=batch_size*gradient_accumulation_steps)
+
+    train_dataloader = dataset_util.PipelineDataLoader(train_data, gradient_accumulation_steps)
+    item = next(train_dataloader)
+    print(item[0][0].size())
+    print(item[1].size())
+    quit()
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():

@@ -176,7 +176,7 @@ class Dataset:
         d['latents'] = self.latent_dataset[selector]['latents']
         for te_idx, te_dataset in enumerate(self.text_embedding_datasets):
             d[f'text_embedding_{te_idx+1}'] = te_dataset[selector]['text_embedding']
-        return d
+        return self.model.prepare_inputs(d)
 
     def __len__(self):
         return self.length
@@ -187,9 +187,10 @@ class Dataset:
 
 
 def split_batch(batch, pieces):
-    # batch is a tuple of tensors
-    split_size = batch[0].size(0) // pieces
-    micro_batches = zip(*(torch.split(tensor, split_size) for tensor in batch))
+    # batch is a tuple of (features, label) where features is also a tuple of tensors
+    features, label = batch
+    split_size = features[0].size(0) // pieces
+    micro_batches = zip(zip(*(torch.split(tensor, split_size) for tensor in features)), torch.split(label, split_size))
     return micro_batches
 
 
@@ -222,18 +223,10 @@ class PipelineDataLoader:
         return micro_batch
 
     def _create_dataloader(self):
-        def collate_fn(x):
-            ret = []
-            ret.append(x['latents'])
-            for key in sorted(x.keys()):
-                if 'text_embedding' in key:
-                    ret.append(x[key])
-            return tuple(ret)
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             pin_memory=True,
-            batch_size=None,
-            collate_fn=collate_fn
+            batch_size=None
         )
         self.data = self._pull_batches_from_dataloader()
         self.num_batches_pulled = 0

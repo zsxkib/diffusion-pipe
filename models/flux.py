@@ -1,5 +1,7 @@
 import diffusers
 import peft
+import torch
+from einops import rearrange, repeat
 
 from utils.common import is_main_process
 
@@ -48,3 +50,32 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
         lora_model = peft.get_peft_model(self.transformer, peft_config)
         if is_main_process():
             lora_model.print_trainable_parameters()
+
+    def prepare_inputs(self, batch):
+        img = batch['latents']
+
+        # The following code taken and slightly modified from x-flux (https://github.com/XLabs-AI/x-flux/tree/main)
+        bs, c, h, w = img.shape
+
+        img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+
+        img_ids = torch.zeros(h // 2, w // 2, 3)
+        img_ids[..., 1] = img_ids[..., 1] + torch.arange(h // 2)[:, None]
+        img_ids[..., 2] = img_ids[..., 2] + torch.arange(w // 2)[None, :]
+        # need .contiguous() for dataloader memory pinning
+        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs).contiguous()
+
+        clip_embed = batch['text_embedding_1']
+        t5_embed = batch['text_embedding_2']
+        txt_ids = torch.zeros(bs, t5_embed.shape[1], 3)
+
+        x_1 = img
+        t = torch.sigmoid(torch.randn((bs,))).view(-1, 1, 1)
+        x_0 = torch.randn_like(x_1).to(x_1.device)
+        x_t = (1 - t) * x_1 + t * x_0
+        noise = x_0 - x_1
+        guidance_vec = torch.full((x_t.shape[0],), self.model_config['guidance'], device=x_t.device, dtype=x_t.dtype)
+
+        features = (img, t5_embed, clip_embed, t, img_ids, txt_ids, guidance_vec)
+        label = noise
+        return (features, label)
