@@ -1,6 +1,7 @@
 import diffusers
 import peft
 import torch
+from torch import nn
 from einops import rearrange, repeat
 
 from utils.common import is_main_process
@@ -48,6 +49,9 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
             target_modules=target_modules
         )
         lora_model = peft.get_peft_model(self.transformer, peft_config)
+        for p in lora_model.parameters():
+            if p.requires_grad:
+                p.data = p.data.to(lora_config['dtype'])
         if is_main_process():
             lora_model.print_trainable_parameters()
 
@@ -73,9 +77,92 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
         t = torch.sigmoid(torch.randn((bs,))).view(-1, 1, 1)
         x_0 = torch.randn_like(x_1).to(x_1.device)
         x_t = (1 - t) * x_1 + t * x_0
-        noise = x_0 - x_1
+        target = x_0 - x_1
         guidance_vec = torch.full((x_t.shape[0],), self.model_config['guidance'], device=x_t.device, dtype=x_t.dtype)
 
         features = (img, t5_embed, clip_embed, t, img_ids, txt_ids, guidance_vec)
-        label = noise
-        return (features, label)
+        return (features, target)
+
+    def to_layers(self):
+        transformer = self.transformer
+        layers = [EmbeddingWrapper(transformer.x_embedder, transformer.time_text_embed, transformer.context_embedder, transformer.pos_embed)]
+        for block in transformer.transformer_blocks:
+            layers.append(TransformerWrapper(block))
+        layers.append(concatenate_hidden_states)
+        for block in transformer.single_transformer_blocks:
+            layers.append(SingleTransformerWrapper(block))
+        layers.append(OutputWrapper(transformer.norm_out, transformer.proj_out))
+        return layers
+
+
+class EmbeddingWrapper(nn.Module):
+    def __init__(self, x_embedder, time_text_embed, context_embedder, pos_embed):
+        super().__init__()
+        self.x_embedder = x_embedder
+        self.time_text_embed = time_text_embed
+        self.context_embedder = context_embedder
+        self.pos_embed = pos_embed
+
+    def forward(self, inputs):
+        hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance = inputs
+        hidden_states = self.x_embedder(hidden_states)
+        # Note: we only do the code path where guidance != None. Not sure why the other path even exists, we always have a guidance vector.
+        timestep = timestep.to(hidden_states.dtype) * 1000
+        guidance = guidance.to(hidden_states.dtype) * 1000
+        temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+        txt_ids = txt_ids.expand(img_ids.size(0), -1, -1)
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        image_rotary_emb = self.pos_embed(ids)
+        return hidden_states, encoder_hidden_states, temb, image_rotary_emb
+
+
+class TransformerWrapper(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def forward(self, inputs):
+        hidden_states, encoder_hidden_states, temb, image_rotary_emb = inputs
+        encoder_hidden_states, hidden_states = self.block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+        )
+        return hidden_states, encoder_hidden_states, temb, image_rotary_emb
+
+
+def concatenate_hidden_states(inputs):
+    hidden_states, encoder_hidden_states, temb, image_rotary_emb = inputs
+    hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+    return hidden_states, encoder_hidden_states, temb, image_rotary_emb
+
+
+class SingleTransformerWrapper(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def forward(self, inputs):
+        hidden_states, encoder_hidden_states, temb, image_rotary_emb = inputs
+        hidden_states = self.block(
+            hidden_states=hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+        )
+        return hidden_states, encoder_hidden_states, temb, image_rotary_emb
+
+
+class OutputWrapper(nn.Module):
+    def __init__(self, norm_out, proj_out):
+        super().__init__()
+        self.norm_out = norm_out
+        self.proj_out = proj_out
+
+    def forward(self, inputs):
+        hidden_states, encoder_hidden_states, temb, image_rotary_emb = inputs
+        hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+        return output

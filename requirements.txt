@@ -8,3 +8,4 @@ pillow
 sentencepiece
 protobuf
 peft
+torch-optimi

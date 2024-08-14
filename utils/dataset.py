@@ -10,7 +10,7 @@ import datasets
 from PIL import Image, ImageOps
 from datasets.fingerprint import Hasher
 
-from . import common
+from utils.common import zero_first, empty_cuda_cache
 
 
 def shuffle_with_seed(l, seed=None):
@@ -99,7 +99,7 @@ class Dataset:
         self.batch_size = batch_size
         self.path = Path(self.config['path'])
         self.cache_dir = self.path / 'cache'
-        with common.zero_first():
+        with zero_first():
             self._init()
 
     def _map_and_cache(self, dataset, map_fn, cache_file_prefix='', new_fingerprint_args=[]):
@@ -120,7 +120,7 @@ class Dataset:
 
     def _get_text_embedding_map_fn(self, i):
         def fn(example):
-            example[f'text_embedding'] = self.model.get_text_embedding(i, example['caption']).squeeze(0)
+            example[f'text_embedding'] = self.model.get_text_embedding(i, example['caption']).to('cpu').squeeze(0)
             return example
         return fn
 
@@ -155,6 +155,7 @@ class Dataset:
         with torch.no_grad():
             self.latent_dataset = self._map_and_cache(dataset, process_image_fn(vae), cache_file_prefix='latent_')
         vae.to('cpu')
+        empty_cuda_cache()
 
         self.text_embedding_datasets = []
         for i, text_encoder in enumerate(self.model.get_text_encoders()):
@@ -162,6 +163,7 @@ class Dataset:
             with torch.no_grad():
                 self.text_embedding_datasets.append(self._map_and_cache(dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
             text_encoder.to('cpu')
+            empty_cuda_cache()
         self.num_examples = len(self.latent_dataset)
         for ds in self.text_embedding_datasets:
             assert len(ds) == self.num_examples

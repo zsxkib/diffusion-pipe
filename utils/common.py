@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import gc
 
 import torch
 import deepspeed.comm.comm as dist
@@ -21,3 +22,8 @@ def zero_first():
     yield
     if is_main_process():
         dist.barrier()
+
+
+def empty_cuda_cache():
+    gc.collect()
+    torch.cuda.empty_cache()

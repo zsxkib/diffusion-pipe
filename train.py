@@ -6,10 +6,19 @@ import glob
 
 import toml
 import deepspeed
+from deepspeed.runtime.pipe import module as ds_pipe_module
+from torch import nn
 
 from utils import dataset as dataset_util
-from utils.common import is_main_process, DTYPE_MAP
+from utils.common import is_main_process, DTYPE_MAP, empty_cuda_cache
 from models import flux
+
+CHECKPOINTABLE_LAYERS = [
+    'EmbeddingWrapper',
+    'TransformerWrapper',
+    'SingleTransformerWrapper',
+    'OutputWrapper',
+]
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--config', help='Path to TOML configuration file.')
@@ -20,19 +29,52 @@ parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
 
+# Monkeypatch this so it counts all layer parameters, not just trainable parameters.
+# This helps it divide the layers between GPUs more evenly when training a LoRA.
+def _count_all_layer_params(self):
+    param_counts = [0] * len(self._layer_specs)
+    for idx, layer in enumerate(self._layer_specs):
+        if isinstance(layer, ds_pipe_module.LayerSpec):
+            l = layer.build()
+            param_counts[idx] = sum(p.numel() for p in l.parameters())
+        elif isinstance(layer, nn.Module):
+            param_counts[idx] = sum(p.numel() for p in layer.parameters())
+    return param_counts
+ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
+
+
 def set_config_defaults(config):
+    config.setdefault('pipeline_stages', 1)
+
     model_config = config['model']
-    model_config['dtype'] = DTYPE_MAP[model_config['dtype']]
+    model_dtype_str = model_config['dtype']
+    model_config['dtype'] = DTYPE_MAP[model_dtype_str]
     model_config.setdefault('guidance', 1.0)
 
     if 'lora' in config:
         lora_config = config['lora']
         lora_config.setdefault('alpha', lora_config['rank'])
         lora_config.setdefault('dropout', 0.0)
+        lora_config.setdefault('dtype', model_dtype_str)
+        lora_config['dtype'] = DTYPE_MAP[lora_config['dtype']]
 
 
 def get_most_recent_run_dir(output_dir):
     return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
+
+
+def print_model_info(model):
+    if not is_main_process():
+        return
+    print(model)
+    for name, module in model.named_modules():
+        print(f'{type(module)}: {name}')
+        for pname, p in module.named_parameters(recurse=False):
+            print(pname)
+            print(p.dtype)
+            print(p.device)
+            print(p.requires_grad)
+            print()
 
 
 if __name__ == '__main__':
@@ -71,11 +113,11 @@ if __name__ == '__main__':
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
     train_data = dataset_util.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=batch_size*gradient_accumulation_steps)
 
-    train_dataloader = dataset_util.PipelineDataLoader(train_data, gradient_accumulation_steps)
-    item = next(train_dataloader)
-    print(item[0][0].size())
-    print(item[1].size())
-    quit()
+    # train_dataloader = dataset_util.PipelineDataLoader(train_data, gradient_accumulation_steps)
+    # item = next(train_dataloader)
+    # print(item[0][0].size())
+    # print(item[1].size())
+    # quit()
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
@@ -86,3 +128,62 @@ if __name__ == '__main__':
     # wait for all processes then get the most recent dir (may have just been created)
     deepspeed.comm.barrier()
     run_dir = get_most_recent_run_dir(config['output_dir'])
+
+    layers = model.to_layers()
+    checkpoint_func = deepspeed.checkpointing.checkpoint
+    pipeline_model = deepspeed.pipe.PipelineModule(
+        layers=layers,
+        num_stages=config['pipeline_stages'],
+        activation_checkpoint_interval=1,
+        checkpointable_layers=CHECKPOINTABLE_LAYERS,
+        activation_checkpoint_func=checkpoint_func,
+        partition_method='parameters',
+    )
+    parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
+
+    def get_optimizer(model_parameters):
+        optim_config = config['optimizer']
+        lr = optim_config['lr']
+        optim_type = optim_config['type'].lower()
+        if optim_type == 'adamw':
+            # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
+            # when Deepspeed tries to build the fused Adam extension.
+            return deepspeed.ops.adam.FusedAdam(
+                model_parameters,
+                lr=lr,
+                betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
+                weight_decay=optim_config.get('weight_decay', 0.01),
+                eps=optim_config.get('eps', 1e-6)
+            )
+        elif optim_type == 'adamw8bit':
+            return bitsandbytes.optim.AdamW8bit(
+                model_parameters,
+                lr=lr,
+                betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
+                weight_decay=optim_config.get('weight_decay', 0.01),
+                eps=optim_config.get('eps', 1e-6)
+            )
+        elif optim_type == 'adamw_kahan':
+            import optimi
+            return optimi.AdamW(
+                model_parameters,
+                lr=lr,
+                betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
+                weight_decay=optim_config.get('weight_decay', 0.01),
+                kahan_sum=optim_config.get('kahan_sum', True),
+                eps=optim_config.get('eps', 1e-6)
+            )
+        else:
+            raise NotImplementedError(optim_type)
+
+    model_engine, optimizer, _, _ = deepspeed.initialize(
+        args=args,
+        model=pipeline_model,
+        model_parameters=parameters_to_train,
+        optimizer=get_optimizer,
+    )
+
+    # sleep so we can observe the memory usage
+    import time
+    print('sleeping...')
+    time.sleep(1e6)
