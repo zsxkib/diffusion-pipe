@@ -52,6 +52,9 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
         lora_model = peft.get_peft_model(self.transformer, peft_config)
         return lora_model, peft_config
 
+    def save_lora(self, save_dir, peft_state_dict):
+        self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
+
     def prepare_inputs(self, batch):
         img = batch['latents']
 

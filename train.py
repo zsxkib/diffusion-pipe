@@ -210,7 +210,7 @@ if __name__ == '__main__':
     step = 1
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
-    saver = utils.saver.Saver(args, config, peft_config, run_dir, train_dataloader, model_engine, pipeline_model)
+    saver = utils.saver.Saver(args, config, peft_config, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
     while True:
         #empty_cuda_cache()

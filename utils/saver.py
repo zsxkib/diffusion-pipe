@@ -5,7 +5,6 @@ import shutil
 import torch
 from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
-import safetensors
 
 from utils.common import is_main_process
 
@@ -16,11 +15,12 @@ def convert_state_dict_dtype(state_dict, dtype):
 
 
 class Saver:
-    def __init__(self, args, config, peft_config, save_root, train_dataloader, model_engine, pipeline_model):
+    def __init__(self, args, config, peft_config, save_root, model, train_dataloader, model_engine, pipeline_model):
         self.args = args
         self.config = config
         self.peft_config = peft_config
         self.save_root = Path(save_root)
+        self.model = model
         self.train_dataloader = train_dataloader
         self.model_engine = model_engine
         self.pipeline_model = pipeline_model
@@ -49,8 +49,7 @@ class Saver:
             state_dict = {}
             for path in tmp_dir.glob('*.bin'):
                 state_dict.update(torch.load(path, weights_only=True, map_location='cpu'))
-            safetensors.torch.save_file(state_dict, save_dir / 'adapter_model.safetensors')
-            self.peft_config.save_pretrained(save_dir)
+            self.model.save_lora(save_dir, state_dict)
             shutil.copy(self.args.config, save_dir)
             shutil.copy(self.args.deepspeed_config, save_dir)
             shutil.rmtree(tmp_dir)
