@@ -147,7 +147,7 @@ class Dataset:
         shuffle_with_seed(image_and_caption_files, seed=0)
         image_files, caption_files = zip(*image_and_caption_files)
         dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
-        dataset = dataset.map(process_caption_fn(shuffle_tags=True), remove_columns='caption_file', keep_in_memory=True)
+        dataset = dataset.map(process_caption_fn(shuffle_tags=self.config['shuffle_tags']), remove_columns='caption_file', keep_in_memory=True)
         dataset.set_format('torch')
 
         vae = self.model.get_vae()

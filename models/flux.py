@@ -50,11 +50,7 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
             target_modules=target_modules
         )
         lora_model = peft.get_peft_model(self.transformer, peft_config)
-        for p in lora_model.parameters():
-            if p.requires_grad:
-                p.data = p.data.to(lora_config['dtype'])
-        if is_main_process():
-            lora_model.print_trainable_parameters()
+        return lora_model, peft_config
 
     def prepare_inputs(self, batch):
         img = batch['latents']
@@ -83,7 +79,7 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
 
         model_dtype = self.model_config['dtype']
         features = (img.to(model_dtype), t5_embed.to(model_dtype), clip_embed.to(model_dtype), t, img_ids, txt_ids, guidance_vec.to(model_dtype))
-        return (features, target.to(model_dtype))
+        return (features, target)
 
     def get_loss_fn(self):
         def loss_fn(output, target):

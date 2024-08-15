@@ -12,6 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from utils import dataset as dataset_util
 from utils.common import is_main_process, DTYPE_MAP, empty_cuda_cache
+import utils.saver
 from models import flux
 
 CHECKPOINTABLE_LAYERS = [
@@ -45,6 +46,9 @@ ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
 def set_config_defaults(config):
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
+    config.setdefault('save_every_n_epochs', 1)
+    if 'save_dtype' in config:
+        config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
 
     model_config = config['model']
     model_dtype_str = model_config['dtype']
@@ -57,6 +61,9 @@ def set_config_defaults(config):
         lora_config.setdefault('dropout', 0.0)
         lora_config.setdefault('dtype', model_dtype_str)
         lora_config['dtype'] = DTYPE_MAP[lora_config['dtype']]
+
+    dataset_config = config['dataset']
+    dataset_config.setdefault('shuffle_tags', False)
 
 
 def get_most_recent_run_dir(output_dir):
@@ -108,7 +115,13 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    model.inject_lora_layers(config['lora'])
+    lora_model, peft_config = model.inject_lora_layers(config['lora'])
+    for name, p in lora_model.named_parameters():
+        p.original_name = name
+        if p.requires_grad:
+            p.data = p.data.to(config['lora']['dtype'])
+    if is_main_process():
+        lora_model.print_trainable_parameters()
 
     batch_size = config.get('batch_size', 1)
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
@@ -197,6 +210,7 @@ if __name__ == '__main__':
     step = 1
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
+    saver = utils.saver.Saver(args, config, peft_config, run_dir, train_dataloader, model_engine, pipeline_model)
 
     while True:
         #empty_cuda_cache()
@@ -204,12 +218,9 @@ if __name__ == '__main__':
         model_engine.reset_activation_shape()
         train_dataloader.sync_epoch()
 
-        if train_dataloader.epoch != epoch:
-            epoch = train_dataloader.epoch
-            if epoch > config['epochs']:
-                break
-            if is_main_process():
-                print(f'Started new epoch: {epoch}')
+        epoch = saver.process_epoch(epoch, step)
+        if epoch is None:
+            break
 
         step += 1
 
