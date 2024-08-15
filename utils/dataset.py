@@ -40,7 +40,7 @@ def encode_pil_to_latents(pil_img, vae):
     img = pil_to_tensor(pil_img)
     img = img.unsqueeze(0)
     latents = vae.encode(img.to(vae.device, vae.dtype)).latent_dist.sample()
-    if hasattr(vae.config, 'shift_factor'):
+    if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
         latents = latents - vae.config.shift_factor
     latents = latents * vae.config.scaling_factor
     latents = latents.to('cpu')

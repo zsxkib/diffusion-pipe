@@ -2,6 +2,7 @@ import diffusers
 import peft
 import torch
 from torch import nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from utils.common import is_main_process
@@ -74,14 +75,22 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
         txt_ids = torch.zeros(bs, t5_embed.shape[1], 3)
 
         x_1 = img
-        t = torch.sigmoid(torch.randn((bs,))).view(-1, 1, 1)
+        t = torch.sigmoid(torch.randn((bs,)))
         x_0 = torch.randn_like(x_1).to(x_1.device)
         x_t = (1 - t) * x_1 + t * x_0
         target = x_0 - x_1
         guidance_vec = torch.full((x_t.shape[0],), self.model_config['guidance'], device=x_t.device, dtype=x_t.dtype)
 
-        features = (img, t5_embed, clip_embed, t, img_ids, txt_ids, guidance_vec)
-        return (features, target)
+        model_dtype = self.model_config['dtype']
+        features = (img.to(model_dtype), t5_embed.to(model_dtype), clip_embed.to(model_dtype), t, img_ids, txt_ids, guidance_vec.to(model_dtype))
+        return (features, target.to(model_dtype))
+
+    def get_loss_fn(self):
+        def loss_fn(output, target):
+            output = output.to(torch.float32)
+            target = target.to(torch.float32)
+            return F.mse_loss(output, target)
+        return loss_fn
 
     def to_layers(self):
         transformer = self.transformer
@@ -104,6 +113,10 @@ class EmbeddingWrapper(nn.Module):
         self.pos_embed = pos_embed
 
     def forward(self, inputs):
+        # Don't know why I have to do this. I had to do it in qlora-pipe also.
+        # Without it, you get RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+        for item in inputs:
+            item.requires_grad_(True)
         hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance = inputs
         hidden_states = self.x_embedder(hidden_states)
         # Note: we only do the code path where guidance != None. Not sure why the other path even exists, we always have a guidance vector.

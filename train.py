@@ -8,16 +8,15 @@ import toml
 import deepspeed
 from deepspeed.runtime.pipe import module as ds_pipe_module
 from torch import nn
+from torch.utils.tensorboard import SummaryWriter
 
 from utils import dataset as dataset_util
 from utils.common import is_main_process, DTYPE_MAP, empty_cuda_cache
 from models import flux
 
 CHECKPOINTABLE_LAYERS = [
-    'EmbeddingWrapper',
     'TransformerWrapper',
     'SingleTransformerWrapper',
-    'OutputWrapper',
 ]
 
 parser = argparse.ArgumentParser()
@@ -45,6 +44,7 @@ ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
 
 def set_config_defaults(config):
     config.setdefault('pipeline_stages', 1)
+    config.setdefault('activation_checkpointing', False)
 
     model_config = config['model']
     model_dtype_str = model_config['dtype']
@@ -97,6 +97,7 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
     model.model_config = model_config
+    model.transformer.train()
 
     # import sys, PIL
     # test_image = sys.argv[1]
@@ -113,12 +114,6 @@ if __name__ == '__main__':
     gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
     train_data = dataset_util.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=batch_size*gradient_accumulation_steps)
 
-    # train_dataloader = dataset_util.PipelineDataLoader(train_data, gradient_accumulation_steps)
-    # item = next(train_dataloader)
-    # print(item[0][0].size())
-    # print(item[1].size())
-    # quit()
-
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
         run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
@@ -130,14 +125,20 @@ if __name__ == '__main__':
     run_dir = get_most_recent_run_dir(config['output_dir'])
 
     layers = model.to_layers()
-    checkpoint_func = deepspeed.checkpointing.checkpoint
+    additional_pipeline_module_kwargs = {}
+    if config['activation_checkpointing']:
+        checkpoint_func = deepspeed.checkpointing.checkpoint
+        additional_pipeline_module_kwargs.update({
+            'activation_checkpoint_interval': 1,
+            'checkpointable_layers': CHECKPOINTABLE_LAYERS,
+            'activation_checkpoint_func': checkpoint_func,
+        })
     pipeline_model = deepspeed.pipe.PipelineModule(
         layers=layers,
         num_stages=config['pipeline_stages'],
-        activation_checkpoint_interval=1,
-        checkpointable_layers=CHECKPOINTABLE_LAYERS,
-        activation_checkpoint_func=checkpoint_func,
         partition_method='parameters',
+        loss_fn=model.get_loss_fn(),
+        **additional_pipeline_module_kwargs
     )
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
 
@@ -183,7 +184,34 @@ if __name__ == '__main__':
         optimizer=get_optimizer,
     )
 
-    # sleep so we can observe the memory usage
-    import time
-    print('sleeping...')
-    time.sleep(1e6)
+    # Might be useful because we set things in fp16 / bf16 without explicitly enabling Deepspeed fp16 mode.
+    # Unsure if really needed.
+    communication_data_type = config['lora']['dtype'] if 'lora' in config else config['model']['dtype']
+    model_engine.communication_data_type = communication_data_type
+
+    train_dataloader = dataset_util.PipelineDataLoader(train_data, gradient_accumulation_steps)
+    model_engine.set_dataloader(train_dataloader)
+    steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
+    model_engine.total_steps = steps_per_epoch * config['epochs']
+
+    step = 1
+    epoch = train_dataloader.epoch
+    tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
+
+    while True:
+        #empty_cuda_cache()
+        loss = model_engine.train_batch()
+        model_engine.reset_activation_shape()
+        train_dataloader.sync_epoch()
+
+        if train_dataloader.epoch != epoch:
+            epoch = train_dataloader.epoch
+            if epoch > config['epochs']:
+                break
+            if is_main_process():
+                print(f'Started new epoch: {epoch}')
+
+        step += 1
+
+    if is_main_process():
+        print('TRAINING COMPLETE!')
