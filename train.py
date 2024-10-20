@@ -7,6 +7,7 @@ import glob
 import toml
 import deepspeed
 from deepspeed.runtime.pipe import module as ds_pipe_module
+import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
@@ -47,6 +48,7 @@ def set_config_defaults(config):
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
     config.setdefault('save_every_n_epochs', 1)
+    config.setdefault('warmup_steps', 0)
     if 'save_dtype' in config:
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
 
@@ -63,7 +65,9 @@ def set_config_defaults(config):
         lora_config['dtype'] = DTYPE_MAP[lora_config['dtype']]
 
     dataset_config = config['dataset']
+    dataset_config.setdefault('resolution', 1024)
     dataset_config.setdefault('shuffle_tags', False)
+    dataset_config.setdefault('caption_prefix', '')
 
 
 def get_most_recent_run_dir(output_dir):
@@ -103,6 +107,7 @@ if __name__ == '__main__':
         model = flux.CustomFluxPipeline.from_pretrained(model_config['path'], torch_dtype=model_config['dtype'])
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
+
     model.model_config = model_config
     model.transformer.train()
 
@@ -115,17 +120,9 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    lora_model, peft_config = model.inject_lora_layers(config['lora'])
-    for name, p in lora_model.named_parameters():
-        p.original_name = name
-        if p.requires_grad:
-            p.data = p.data.to(config['lora']['dtype'])
-    if is_main_process():
-        lora_model.print_trainable_parameters()
+    peft_config = model.inject_lora_layers(config['lora'])
 
-    batch_size = config.get('batch_size', 1)
-    gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
-    train_data = dataset_util.Dataset(config['dataset'], model, data_parallel_rank=0, data_parallel_world_size=1, batch_size=batch_size*gradient_accumulation_steps)
+    train_data = dataset_util.Dataset(config['dataset'], model)
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
@@ -150,7 +147,6 @@ if __name__ == '__main__':
         layers=layers,
         num_stages=config['pipeline_stages'],
         partition_method='parameters',
-        loss_fn=model.get_loss_fn(),
         **additional_pipeline_module_kwargs
     )
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
@@ -162,7 +158,14 @@ if __name__ == '__main__':
         if optim_type == 'adamw':
             # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
             # when Deepspeed tries to build the fused Adam extension.
-            return deepspeed.ops.adam.FusedAdam(
+            # return deepspeed.ops.adam.FusedAdam(
+            #     model_parameters,
+            #     lr=lr,
+            #     betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
+            #     weight_decay=optim_config.get('weight_decay', 0.01),
+            #     eps=optim_config.get('eps', 1e-6)
+            # )
+            return torch.optim.AdamW(
                 model_parameters,
                 lr=lr,
                 betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
@@ -197,12 +200,26 @@ if __name__ == '__main__':
         optimizer=get_optimizer,
     )
 
+    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+    if config['warmup_steps'] > 0:
+        warmup_steps = config['warmup_steps']
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+    model_engine.lr_scheduler = lr_scheduler
+
+    train_data.post_init(
+        model_engine.grid.get_data_parallel_rank(),
+        model_engine.grid.get_data_parallel_world_size(),
+        model_engine.train_micro_batch_size_per_gpu(),
+        model_engine.gradient_accumulation_steps(),
+    )
+
     # Might be useful because we set things in fp16 / bf16 without explicitly enabling Deepspeed fp16 mode.
     # Unsure if really needed.
     communication_data_type = config['lora']['dtype'] if 'lora' in config else config['model']['dtype']
     model_engine.communication_data_type = communication_data_type
 
-    train_dataloader = dataset_util.PipelineDataLoader(train_data, gradient_accumulation_steps)
+    train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine.gradient_accumulation_steps())
     model_engine.set_dataloader(train_dataloader)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
     model_engine.total_steps = steps_per_epoch * config['epochs']

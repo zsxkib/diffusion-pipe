@@ -10,7 +10,7 @@ import datasets
 from PIL import Image, ImageOps
 from datasets.fingerprint import Hasher
 
-from utils.common import zero_first, empty_cuda_cache
+from utils.common import zero_first, empty_cuda_cache, is_main_process
 
 
 def shuffle_with_seed(l, seed=None):
@@ -20,7 +20,7 @@ def shuffle_with_seed(l, seed=None):
     random.setstate(rng_state)
 
 
-def crop_and_resize(pil_img):
+def crop_and_resize(pil_img, resolution):
     if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
         pil_img = pil_img.convert('RGBA')
 
@@ -32,7 +32,7 @@ def crop_and_resize(pil_img):
     else:
         pil_img = pil_img.convert('RGB')
 
-    return ImageOps.fit(pil_img, (1024, 1024))
+    return ImageOps.fit(pil_img, (resolution, resolution))
 
 
 pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
@@ -58,7 +58,7 @@ def decode_latents_to_pil(latents, vae):
     return tensor_to_pil(img)
 
 
-def process_caption_fn(shuffle_tags=False):
+def process_caption_fn(shuffle_tags=False, caption_prefix=''):
     def fn(example):
         with open(example['caption_file']) as f:
             caption = f.read().strip()
@@ -66,13 +66,14 @@ def process_caption_fn(shuffle_tags=False):
             tags = [tag.strip() for tag in caption.split(',')]
             random.shuffle(tags)
             caption = ', '.join(tags)
+        caption = caption_prefix + caption
 
         example['caption'] = caption
         return example
     return fn
 
 
-def process_image_fn(vae):
+def process_image_fn(vae, resolution):
     def fn(example):
         image_file = example['image_file']
         try:
@@ -80,7 +81,7 @@ def process_image_fn(vae):
         except Exception:
             logger.warning(f'Image file {image_file} could not be opened. Skipping.')
             return None
-        pil_img = crop_and_resize(pil_img)
+        pil_img = crop_and_resize(pil_img, resolution)
         latents = encode_pil_to_latents(pil_img, vae)
 
         example['latents'] = latents.squeeze(0)
@@ -91,12 +92,9 @@ def process_image_fn(vae):
 # Dataset that does caching, batching, and dividing batches across data parallel ranks.
 # Logically represents a single folder of images and captions on disk.
 class Dataset:
-    def __init__(self, dataset_config, model, data_parallel_rank, data_parallel_world_size, batch_size):
+    def __init__(self, dataset_config, model):
         self.config = dataset_config
         self.model = model
-        self.data_parallel_rank = data_parallel_rank
-        self.data_parallel_world_size = data_parallel_world_size
-        self.batch_size = batch_size
         self.path = Path(self.config['path'])
         self.cache_dir = self.path / 'cache'
         with zero_first():
@@ -141,25 +139,28 @@ class Dataset:
             caption_file = image_file.with_suffix('.txt')
             if not os.path.exists(caption_file):
                 logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
+                continue
             image_and_caption_files.append((str(image_file), str(caption_file)))
         # This is the one place we shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
         # Processes other than rank 0 will then load it from cache.
         shuffle_with_seed(image_and_caption_files, seed=0)
         image_files, caption_files = zip(*image_and_caption_files)
         dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
-        dataset = dataset.map(process_caption_fn(shuffle_tags=self.config['shuffle_tags']), remove_columns='caption_file', keep_in_memory=True)
+        dataset = dataset.map(process_caption_fn(shuffle_tags=self.config['shuffle_tags'], caption_prefix=self.config['caption_prefix']), remove_columns='caption_file', keep_in_memory=True)
         dataset.set_format('torch')
 
         vae = self.model.get_vae()
-        vae.to('cuda')
+        if is_main_process():
+            vae.to('cuda')
         with torch.no_grad():
-            self.latent_dataset = self._map_and_cache(dataset, process_image_fn(vae), cache_file_prefix='latent_')
+            self.latent_dataset = self._map_and_cache(dataset, process_image_fn(vae, self.config['resolution']), cache_file_prefix='latent_')
         vae.to('cpu')
         empty_cuda_cache()
 
         self.text_embedding_datasets = []
         for i, text_encoder in enumerate(self.model.get_text_encoders()):
-            text_encoder.to('cuda')
+            if is_main_process():
+                text_encoder.to('cuda')
             with torch.no_grad():
                 self.text_embedding_datasets.append(self._map_and_cache(dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
             text_encoder.to('cpu')
@@ -167,6 +168,11 @@ class Dataset:
         self.num_examples = len(self.latent_dataset)
         for ds in self.text_embedding_datasets:
             assert len(ds) == self.num_examples
+
+    def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_world_size = data_parallel_world_size
+        self.batch_size = per_device_batch_size * gradient_accumulation_steps
         self._make_divisible_by(self.data_parallel_world_size * self.batch_size)
 
     def __getitem__(self, i):
@@ -189,11 +195,11 @@ class Dataset:
 
 
 def split_batch(batch, pieces):
-    # batch is a tuple of (features, label) where features is also a tuple of tensors
-    features, label = batch
-    split_size = features[0].size(0) // pieces
-    micro_batches = zip(zip(*(torch.split(tensor, split_size) for tensor in features)), torch.split(label, split_size))
-    return micro_batches
+    # Deepspeed always expects (features, labels), even when labels is None
+    example_tuple, labels = batch
+    split_size = example_tuple[0].size(0) // pieces
+    split_examples = zip(*(torch.split(tensor, split_size) for tensor in example_tuple))
+    return [(ex, None) for ex in split_examples]
 
 
 # DataLoader that divides batches into microbatches for gradient accumulation steps when doing

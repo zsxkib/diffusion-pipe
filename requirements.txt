@@ -2,8 +2,7 @@ deepspeed
 toml
 transformers
 diffusers
-# until version >2.20.0 is released, this works around a bug with map and bfloat16
-git+https://github.com/huggingface/datasets
+datasets
 pillow
 sentencepiece
 protobuf
