@@ -117,9 +117,12 @@ if __name__ == '__main__':
 
     peft_config = model.inject_lora_layers(config['lora'])
 
+    dataset_manager = dataset_util.DatasetManager(model)
     with open(config['dataset']) as f:
         dataset_config = toml.load(f)
     train_data = dataset_util.Dataset(dataset_config, model)
+    dataset_manager.register(train_data)
+    dataset_manager.cache()
 
     quit()
 

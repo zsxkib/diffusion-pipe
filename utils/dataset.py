@@ -102,9 +102,18 @@ class SizeBucketDataset:
         self.size_bucket = size_bucket
         self.model = model
         self.path = Path(self.config['path'])
-        self.cache_dir = self.path / f'cache_{size_bucket[0]}x{size_bucket[1]}'
-        with zero_first():
-            self._init()
+        self.cache_dir = self.path / 'cache' / f'cache_{size_bucket[0]}x{size_bucket[1]}'
+        self.text_embedding_datasets = []
+
+        os.makedirs(self.cache_dir, exist_ok=True)
+        image_and_caption_files = self.filepaths
+        # This is the one place we shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
+        # Processes other than rank 0 will then load it from cache.
+        shuffle_with_seed(image_and_caption_files, seed=0)
+        image_files, caption_files = zip(*image_and_caption_files)
+        ds = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
+        self.image_file_and_caption_dataset = ds.map(process_caption_fn(shuffle_tags=self.config['shuffle_tags'], caption_prefix=self.config['caption_prefix']), remove_columns='caption_file', keep_in_memory=True)
+        self.image_file_and_caption_dataset.set_format('torch')
 
     def _map_and_cache(self, dataset, map_fn, cache_file_prefix='', new_fingerprint_args=[]):
         # Do the fingerprinting ourselves, because otherwise map() does it by serializing the map function.
@@ -128,40 +137,15 @@ class SizeBucketDataset:
             return example
         return fn
 
-    def _make_divisible_by(self, n):
-        self.length = self.num_examples // n
-        self.num_examples = self.length * n
-
-    def _init(self):
-        os.makedirs(self.cache_dir, exist_ok=True)
-        image_and_caption_files = self.filepaths
-        # This is the one place we shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
-        # Processes other than rank 0 will then load it from cache.
-        shuffle_with_seed(image_and_caption_files, seed=0)
-        image_files, caption_files = zip(*image_and_caption_files)
-        dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
-        dataset = dataset.map(process_caption_fn(shuffle_tags=self.config['shuffle_tags'], caption_prefix=self.config['caption_prefix']), remove_columns='caption_file', keep_in_memory=True)
-        dataset.set_format('torch')
-
-        vae = self.model.get_vae()
-        if is_main_process():
-            vae.to('cuda')
+    # TODO: just like the model is responsible for implementing a method to get the text embedding for a caption, it should probably also
+    # have a method to get the latents from an image, rather than having the code for that in this file.
+    def _cache_latents(self, vae):
         with torch.no_grad():
-            self.latent_dataset = self._map_and_cache(dataset, process_image_fn(vae, self.size_bucket), cache_file_prefix='latent_')
-        vae.to('cpu')
-        empty_cuda_cache()
+            self.latent_dataset = self._map_and_cache(self.image_file_and_caption_dataset, process_image_fn(vae, self.size_bucket), cache_file_prefix='latent_')
 
-        self.text_embedding_datasets = []
-        for i, text_encoder in enumerate(self.model.get_text_encoders()):
-            if is_main_process():
-                text_encoder.to('cuda')
-            with torch.no_grad():
-                self.text_embedding_datasets.append(self._map_and_cache(dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
-            text_encoder.to('cpu')
-            empty_cuda_cache()
-        self.num_examples = len(self.latent_dataset)
-        for ds in self.text_embedding_datasets:
-            assert len(ds) == self.num_examples
+    def _cache_text_embedding(self, i):
+        with torch.no_grad():
+            self.text_embedding_datasets.append(self._map_and_cache(self.image_file_and_caption_dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
 
     def __getitem__(self, i):
         latents = self.latent_dataset[i]['latents']
@@ -169,7 +153,7 @@ class SizeBucketDataset:
         return tuple(latents, *text_embeddings)
 
     def __len__(self):
-        return len(self.latent_dataset)
+        return len(self.image_file_and_caption_dataset)
 
     def __iter__(self):
         for i in range(len(self)):
@@ -197,7 +181,7 @@ class ConcatenatedDataset:
         new_length = (len(self) // n) * n
         self.iteration_order = self.iteration_order[:new_length]
         if new_length == 0 and is_main_process():
-            print(f"WARNING: size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
+            logger.warning(f"size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
 
 
 class Dataset:
@@ -299,6 +283,41 @@ class Dataset:
                 best_ar_diff = ar_diff
                 best_size_bucket = size_bucket
         return best_size_bucket
+
+
+# Helper class to make caching multiple datasets more efficient by moving
+# models to GPU as few times as needed.
+class DatasetManager:
+    def __init__(self, model):
+        self.model = model
+        self.datasets = []
+
+    def register(self, dataset):
+        for bucket in dataset.buckets:
+            for ds in bucket.datasets:
+                self.datasets.append(ds)
+
+    def cache(self):
+        with zero_first():
+            self._cache()
+
+    @torch.no_grad()
+    def _cache(self):
+        vae = self.model.get_vae()
+        if is_main_process():
+            vae.to('cuda')
+        for ds in self.datasets:
+            ds._cache_latents(vae)
+        vae.to('cpu')
+        empty_cuda_cache()
+
+        for i, text_encoder in enumerate(self.model.get_text_encoders()):
+            if is_main_process():
+                text_encoder.to('cuda')
+            for ds in self.datasets:
+                ds._cache_text_embedding(i)
+            text_encoder.to('cpu')
+            empty_cuda_cache()
 
 
 def split_batch(batch, pieces):
