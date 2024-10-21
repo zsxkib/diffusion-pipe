@@ -64,11 +64,6 @@ def set_config_defaults(config):
         lora_config.setdefault('dtype', model_dtype_str)
         lora_config['dtype'] = DTYPE_MAP[lora_config['dtype']]
 
-    dataset_config = config['dataset']
-    dataset_config.setdefault('resolution', 1024)
-    dataset_config.setdefault('shuffle_tags', False)
-    dataset_config.setdefault('caption_prefix', '')
-
 
 def get_most_recent_run_dir(output_dir):
     return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
@@ -122,7 +117,11 @@ if __name__ == '__main__':
 
     peft_config = model.inject_lora_layers(config['lora'])
 
-    train_data = dataset_util.Dataset(config['dataset'], model)
+    with open(config['dataset']) as f:
+        dataset_config = toml.load(f)
+    train_data = dataset_util.Dataset(dataset_config, model)
+
+    quit()
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():

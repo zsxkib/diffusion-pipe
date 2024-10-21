@@ -1,6 +1,7 @@
 from pathlib import Path
 import os.path
 import random
+from collections import defaultdict
 
 import torch
 from torchvision import transforms
@@ -20,7 +21,7 @@ def shuffle_with_seed(l, seed=None):
     random.setstate(rng_state)
 
 
-def crop_and_resize(pil_img, resolution):
+def crop_and_resize(pil_img, size_bucket):
     if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
         pil_img = pil_img.convert('RGBA')
 
@@ -32,7 +33,7 @@ def crop_and_resize(pil_img, resolution):
     else:
         pil_img = pil_img.convert('RGB')
 
-    return ImageOps.fit(pil_img, (resolution, resolution))
+    return ImageOps.fit(pil_img, size_bucket)
 
 
 pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
@@ -73,7 +74,7 @@ def process_caption_fn(shuffle_tags=False, caption_prefix=''):
     return fn
 
 
-def process_image_fn(vae, resolution):
+def process_image_fn(vae, size_bucket):
     def fn(example):
         image_file = example['image_file']
         try:
@@ -81,7 +82,7 @@ def process_image_fn(vae, resolution):
         except Exception:
             logger.warning(f'Image file {image_file} could not be opened. Skipping.')
             return None
-        pil_img = crop_and_resize(pil_img, resolution)
+        pil_img = crop_and_resize(pil_img, size_bucket)
         latents = encode_pil_to_latents(pil_img, vae)
 
         example['latents'] = latents.squeeze(0)
@@ -91,12 +92,17 @@ def process_image_fn(vae, resolution):
 
 # Dataset that does caching, batching, and dividing batches across data parallel ranks.
 # Logically represents a single folder of images and captions on disk.
-class Dataset:
-    def __init__(self, dataset_config, model):
+class SizeBucketDataset:
+    def __init__(self, filepaths, dataset_config, size_bucket, model):
+        print(f'size_bucket: {size_bucket}, num_images: {len(filepaths)}')
+        self.filepaths = filepaths
         self.config = dataset_config
+        self.config.setdefault('shuffle_tags', False)
+        self.config.setdefault('caption_prefix', '')
+        self.size_bucket = size_bucket
         self.model = model
         self.path = Path(self.config['path'])
-        self.cache_dir = self.path / 'cache'
+        self.cache_dir = self.path / f'cache_{size_bucket[0]}x{size_bucket[1]}'
         with zero_first():
             self._init()
 
@@ -128,19 +134,7 @@ class Dataset:
 
     def _init(self):
         os.makedirs(self.cache_dir, exist_ok=True)
-        image_and_caption_files = []
-        files = list(self.path.glob('*'))
-        # deterministic order
-        files.sort()
-        for file in files:
-            if not file.is_file() or file.suffix == '.txt':
-                continue
-            image_file = file
-            caption_file = image_file.with_suffix('.txt')
-            if not os.path.exists(caption_file):
-                logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
-                continue
-            image_and_caption_files.append((str(image_file), str(caption_file)))
+        image_and_caption_files = self.filepaths
         # This is the one place we shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
         # Processes other than rank 0 will then load it from cache.
         shuffle_with_seed(image_and_caption_files, seed=0)
@@ -153,7 +147,7 @@ class Dataset:
         if is_main_process():
             vae.to('cuda')
         with torch.no_grad():
-            self.latent_dataset = self._map_and_cache(dataset, process_image_fn(vae, self.config['resolution']), cache_file_prefix='latent_')
+            self.latent_dataset = self._map_and_cache(dataset, process_image_fn(vae, self.size_bucket), cache_file_prefix='latent_')
         vae.to('cpu')
         empty_cuda_cache()
 
@@ -169,36 +163,150 @@ class Dataset:
         for ds in self.text_embedding_datasets:
             assert len(ds) == self.num_examples
 
-    def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
-        self.data_parallel_rank = data_parallel_rank
-        self.data_parallel_world_size = data_parallel_world_size
-        self.batch_size = per_device_batch_size * gradient_accumulation_steps
-        self._make_divisible_by(self.data_parallel_world_size * self.batch_size)
-
     def __getitem__(self, i):
-        if i >= len(self):
-            return IndexError('Dataset index out of range')
-        idx = (i * self.data_parallel_world_size + self.data_parallel_rank) * self.batch_size
-        selector = slice(idx, idx + self.batch_size)
-        d = {}
-        d['latents'] = self.latent_dataset[selector]['latents']
-        for te_idx, te_dataset in enumerate(self.text_embedding_datasets):
-            d[f'text_embedding_{te_idx+1}'] = te_dataset[selector]['text_embedding']
-        return self.model.prepare_inputs(d)
+        latents = self.latent_dataset[i]['latents']
+        text_embeddings = [te_dataset[i] for te_dataset in self.text_embedding_datasets]
+        return tuple(latents, *text_embeddings)
 
     def __len__(self):
-        return self.length
+        return len(self.latent_dataset)
 
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
 
 
+class ConcatenatedDataset:
+    def __init__(self, datasets):
+        self.datasets = datasets
+        iteration_order = []
+        for i, ds in enumerate(self.datasets):
+            iteration_order.extend([i]*len(ds))
+        shuffle_with_seed(iteration_order, 0)
+        self.iteration_order = iteration_order
+
+    def __len__(self):
+        return len(self.iteration_order)
+
+    def __iter__(self):
+        iterators = [iter(ds) for ds in self.datasets]
+        for i in self.iteration_order:
+            yield next(iterators[i])
+
+    def _make_divisible_by(self, n):
+        new_length = (len(self) // n) * n
+        self.iteration_order = self.iteration_order[:new_length]
+        if new_length == 0 and is_main_process():
+            print(f"WARNING: size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
+
+
+class Dataset:
+    def __init__(self, dataset_config, model):
+        res = dataset_config['resolution']
+
+        if dataset_config.get('enable_bucket', False):
+            min_bucket_reso = dataset_config.get('min_bucket_reso')
+            max_bucket_reso = dataset_config.get('max_bucket_reso')
+            bucket_reso_steps = dataset_config.get('bucket_reso_steps')
+            side1 = res
+            side2 = res
+            size_buckets = set()
+            while side1 <= max_bucket_reso and side2 >= min_bucket_reso:
+                size_buckets.add((side1, side2))
+                size_buckets.add((side2, side1))
+                side1 += bucket_reso_steps
+                side2 -= bucket_reso_steps
+        else:
+            size_buckets = {(res, res)}
+        size_buckets = list(size_buckets)
+
+        datasets_by_size_bucket = defaultdict(list)
+        for directory_config in dataset_config['directory']:
+            size_bucket_to_filepaths = self._split_into_size_buckets(directory_config['path'], size_buckets)
+            for size_bucket, filepaths in size_bucket_to_filepaths.items():
+                datasets_by_size_bucket[size_bucket].append(SizeBucketDataset(filepaths, directory_config, size_bucket, model))
+
+        self.buckets = []
+        for datasets in datasets_by_size_bucket.values():
+            self.buckets.append(ConcatenatedDataset(datasets))
+
+    def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_world_size = data_parallel_world_size
+        self.batch_size = per_device_batch_size * gradient_accumulation_steps
+        self.global_batch_size = self.data_parallel_world_size * self.batch_size
+        self._make_divisible_by(self.global_batch_size)
+
+    def _make_divisible_by(self, n):
+        for ds in self.buckets:
+            ds._make_divisible_by(n)
+        iteration_order = []
+        for i, bucket in enumerate(self.buckets):
+            iteration_order.extend([i]*len(bucket))
+        shuffle_with_seed(iteration_order, 0)
+        self.iteration_order = iteration_order
+
+    def __len__(self):
+        return len(self.iteration_order)
+
+    def __iter__(self):
+        iterators = [iter(bucket) for bucket in self.buckets]
+        examples = []
+        for i in self.iteration_order:
+            examples.append(next(iterators[i]))
+            if len(examples) == self.global_batch_size:
+                batch = self._collate(examples)
+                start_idx = self.data_parallel_rank*self.batch_size
+                selector = slice(start_idx, start_idx + self.batch_size)
+                batch_for_this_dp_rank = tuple(x[selector] for x in batch)
+                yield self.model.prepare_inputs(batch_for_this_dp_rank)
+
+    def _collate(self, examples):
+        return tuple(torch.cat(tensors) for tensors in zip(*examples))
+
+    def _split_into_size_buckets(self, path, size_buckets):
+        size_bucket_to_filepaths = defaultdict(list)
+        files = list(Path(path).glob('*'))
+        # deterministic order
+        files.sort()
+        for file in files:
+            if not file.is_file() or file.suffix == '.txt':
+                continue
+            image_file = file
+            caption_file = image_file.with_suffix('.txt')
+            if not os.path.exists(caption_file):
+                logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
+                continue
+            size_bucket = self._find_closest_size_bucket(image_file, size_buckets)
+            if size_bucket:
+                size_bucket_to_filepaths[size_bucket].append((str(image_file), str(caption_file)))
+        return size_bucket_to_filepaths
+
+    def _find_closest_size_bucket(self, image_file, size_buckets):
+        try:
+            pil_img = Image.open(image_file)
+        except Exception:
+            logger.warning(f'Image file {image_file} could not be opened. Skipping.')
+            return None
+        width, height = pil_img.size
+        ar = width / height
+        best_size_bucket = None
+        best_ar_diff = float('inf')
+        for size_bucket in size_buckets:
+            bucket_ar = size_bucket[0] / size_bucket[1]
+            ar_diff = abs(bucket_ar - ar)
+            if ar_diff < best_ar_diff:
+                best_ar_diff = ar_diff
+                best_size_bucket = size_bucket
+        return best_size_bucket
+
+
 def split_batch(batch, pieces):
-    # Deepspeed always expects (features, labels), even when labels is None
-    example_tuple, labels = batch
+    example_tuple = batch
     split_size = example_tuple[0].size(0) // pieces
     split_examples = zip(*(torch.split(tensor, split_size) for tensor in example_tuple))
+    # Deepspeed works with a tuple of (features, labels), even if we don't provide a loss_fn to PipelineEngine,
+    # and instead compute the loss ourselves in the model. It's okay to just return None for the labels here.
     return [(ex, None) for ex in split_examples]
 
 

@@ -70,22 +70,18 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
     def save_lora(self, save_dir, peft_state_dict):
         self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
 
-    def prepare_inputs(self, batch):
-        img = batch['latents']
+    def prepare_inputs(self, inputs):
+        latents, clip_embed, t5_embed = inputs
 
         # The following code taken and slightly modified from x-flux (https://github.com/XLabs-AI/x-flux/tree/main)
-        bs, c, h, w = img.shape
+        bs, c, h, w = latents.shape
+        latents = rearrange(latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
 
-        img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        img_ids = self._prepare_latent_image_ids(bs, h, w, latents.device, latents.dtype)
+        txt_ids = torch.zeros(bs, t5_embed.shape[1], 3).to(latents.device, latents.dtype)
 
-        img_ids = self._prepare_latent_image_ids(bs, h, w, img.device, img.dtype)
-
-        clip_embed = batch['text_embedding_1']
-        t5_embed = batch['text_embedding_2']
-        txt_ids = torch.zeros(bs, t5_embed.shape[1], 3).to(img.device, img.dtype)
-
-        x_1 = img
-        t = torch.sigmoid(torch.randn((bs,), device=img.device))
+        x_1 = latents
+        t = torch.sigmoid(torch.randn((bs,), device=latents.device))
         x_0 = torch.randn_like(x_1)
         t_expanded = t.view(-1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
@@ -96,15 +92,8 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
         features = (x_t.to(model_dtype), t5_embed.to(model_dtype), clip_embed.to(model_dtype), t, img_ids, txt_ids, guidance_vec, target)
 
         # We pass the target through the layers of the model in the features tuple, so that it matches the noisy input when we get to the
-        # last pipeline parallel stage. The labels here is just None, and we don't pass a loss_fn to deepspeed PipelineModule.
-        return (features, None)
-
-    def get_loss_fn(self):
-        def loss_fn(output, target):
-            output = output.to(torch.float32)
-            target = target.to(torch.float32)
-            return F.mse_loss(output, target)
-        return loss_fn
+        # last pipeline parallel stage.
+        return features
 
     def to_layers(self):
         transformer = self.transformer
