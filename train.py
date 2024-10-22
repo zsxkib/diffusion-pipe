@@ -103,6 +103,8 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
+    # TODO: don't directly inherit from diffusers.FluxPipeline, just make a new class and use composition, so we don't
+    # need to set this attribute after creating the object.
     model.model_config = model_config
     model.transformer.train()
 
@@ -123,8 +125,6 @@ if __name__ == '__main__':
     train_data = dataset_util.Dataset(dataset_config, model)
     dataset_manager.register(train_data)
     dataset_manager.cache()
-
-    quit()
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():

@@ -14,6 +14,9 @@ from datasets.fingerprint import Hasher
 from utils.common import zero_first, empty_cuda_cache, is_main_process
 
 
+DEBUG = False
+
+
 def shuffle_with_seed(l, seed=None):
     rng_state = random.getstate()
     random.seed(seed)
@@ -94,7 +97,7 @@ def process_image_fn(vae, size_bucket):
 # Logically represents a single folder of images and captions on disk.
 class SizeBucketDataset:
     def __init__(self, filepaths, dataset_config, size_bucket, model):
-        print(f'size_bucket: {size_bucket}, num_images: {len(filepaths)}')
+        logger.info(f'size_bucket: {size_bucket}, num_images: {len(filepaths)}')
         self.filepaths = filepaths
         self.config = dataset_config
         self.config.setdefault('shuffle_tags', False)
@@ -148,9 +151,11 @@ class SizeBucketDataset:
             self.text_embedding_datasets.append(self._map_and_cache(self.image_file_and_caption_dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
 
     def __getitem__(self, i):
+        if DEBUG:
+            print(Path(self.image_file_and_caption_dataset[i]['image_file']).stem)
         latents = self.latent_dataset[i]['latents']
-        text_embeddings = [te_dataset[i] for te_dataset in self.text_embedding_datasets]
-        return tuple(latents, *text_embeddings)
+        text_embeddings = [te_dataset[i]['text_embedding'] for te_dataset in self.text_embedding_datasets]
+        return latents, *text_embeddings
 
     def __len__(self):
         return len(self.image_file_and_caption_dataset)
@@ -184,8 +189,11 @@ class ConcatenatedDataset:
             logger.warning(f"size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
 
 
-class Dataset:
+class Dataset(torch.utils.data.IterableDataset):
     def __init__(self, dataset_config, model):
+        super().__init__()
+        self.model = model
+        self.post_init_called = False
         res = dataset_config['resolution']
 
         if dataset_config.get('enable_bucket', False):
@@ -220,36 +228,45 @@ class Dataset:
         self.batch_size = per_device_batch_size * gradient_accumulation_steps
         self.global_batch_size = self.data_parallel_world_size * self.batch_size
         self._make_divisible_by(self.global_batch_size)
+        self.post_init_called = True
 
     def _make_divisible_by(self, n):
         for ds in self.buckets:
             ds._make_divisible_by(n)
         iteration_order = []
         for i, bucket in enumerate(self.buckets):
-            iteration_order.extend([i]*len(bucket))
+            iteration_order.extend([i]*(len(bucket) // n))
         shuffle_with_seed(iteration_order, 0)
         self.iteration_order = iteration_order
+        if DEBUG:
+            print(f'Dataset iteration_order: {self.iteration_order}')
 
     def __len__(self):
+        assert self.post_init_called
         return len(self.iteration_order)
 
     def __iter__(self):
+        assert self.post_init_called
         iterators = [iter(bucket) for bucket in self.buckets]
-        examples = []
         for i in self.iteration_order:
-            examples.append(next(iterators[i]))
-            if len(examples) == self.global_batch_size:
-                batch = self._collate(examples)
-                start_idx = self.data_parallel_rank*self.batch_size
-                selector = slice(start_idx, start_idx + self.batch_size)
-                batch_for_this_dp_rank = tuple(x[selector] for x in batch)
-                yield self.model.prepare_inputs(batch_for_this_dp_rank)
+            iterator = iterators[i]
+            examples = [next(iterator) for _ in range(self.global_batch_size)]
+            batch = self._collate(examples)
+            start_idx = self.data_parallel_rank*self.batch_size
+            selector = slice(start_idx, start_idx + self.batch_size)
+            if DEBUG:
+                print(selector)
+            batch_for_this_dp_rank = tuple(x[selector] for x in batch)
+            yield self.model.prepare_inputs(batch_for_this_dp_rank)
 
     def _collate(self, examples):
-        return tuple(torch.cat(tensors) for tensors in zip(*examples))
+        return tuple(torch.stack(tensors, dim=0) for tensors in zip(*examples))
 
     def _split_into_size_buckets(self, path, size_buckets):
         size_bucket_to_filepaths = defaultdict(list)
+        path = Path(path)
+        if not path.exists() or not path.is_dir():
+            raise RuntimeError(f'Invalid path: {path}')
         files = list(Path(path).glob('*'))
         # deterministic order
         files.sort()
@@ -383,3 +400,34 @@ class PipelineDataLoader:
         for epoch in result:
             max_epoch = max(epoch, max_epoch)
         self.epoch = max_epoch
+
+
+if __name__ == '__main__':
+    from utils import common
+    common.is_main_process = lambda: True
+    from contextlib import contextmanager
+    @contextmanager
+    def _zero_first():
+        yield
+    common.zero_first = _zero_first
+
+    from utils import dataset as dataset_util
+    dataset_util.DEBUG = True
+
+    from models import flux
+    model = flux.CustomFluxPipeline.from_pretrained('/data2/imagegen_models/FLUX.1-dev', torch_dtype=torch.bfloat16)
+    model.model_config = {'guidance': 1.0, 'dtype': torch.bfloat16}
+
+    import toml
+    dataset_manager = dataset_util.DatasetManager(model)
+    with open('/home/anon/code/diffusion-pipe-configs/datasets/tiny1.toml') as f:
+        dataset_config = toml.load(f)
+    train_data = dataset_util.Dataset(dataset_config, model)
+    dataset_manager.register(train_data)
+    dataset_manager.cache()
+
+    train_data.post_init(data_parallel_rank=2, data_parallel_world_size=4, per_device_batch_size=1, gradient_accumulation_steps=1)
+    print(f'Dataset length: {len(train_data)}')
+
+    for item in train_data:
+        pass
