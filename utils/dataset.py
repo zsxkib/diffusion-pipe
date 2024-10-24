@@ -10,6 +10,7 @@ from deepspeed import comm as dist
 import datasets
 from PIL import Image, ImageOps
 from datasets.fingerprint import Hasher
+from tqdm import tqdm
 
 from utils.common import zero_first, empty_cuda_cache, is_main_process
 
@@ -194,6 +195,7 @@ class Dataset(torch.utils.data.IterableDataset):
         super().__init__()
         self.model = model
         self.post_init_called = False
+        self.eval_quantile = None
         res = dataset_config['resolution']
 
         if dataset_config.get('enable_bucket', False):
@@ -230,6 +232,9 @@ class Dataset(torch.utils.data.IterableDataset):
         self._make_divisible_by(self.global_batch_size)
         self.post_init_called = True
 
+    def set_eval_quantile(self, quantile):
+        self.eval_quantile = quantile
+
     def _make_divisible_by(self, n):
         for ds in self.buckets:
             ds._make_divisible_by(n)
@@ -257,7 +262,7 @@ class Dataset(torch.utils.data.IterableDataset):
             if DEBUG:
                 print(selector)
             batch_for_this_dp_rank = tuple(x[selector] for x in batch)
-            yield self.model.prepare_inputs(batch_for_this_dp_rank)
+            yield self.model.prepare_inputs(batch_for_this_dp_rank, timestep_quantile=self.eval_quantile)
 
     def _collate(self, examples):
         return tuple(torch.stack(tensors, dim=0) for tensors in zip(*examples))

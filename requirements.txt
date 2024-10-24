@@ -9,3 +9,4 @@ protobuf
 peft
 torch-optimi
 tensorboard
+tqdm

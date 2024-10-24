@@ -70,7 +70,7 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
     def save_lora(self, save_dir, peft_state_dict):
         self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
 
-    def prepare_inputs(self, inputs):
+    def prepare_inputs(self, inputs, timestep_quantile=None):
         latents, clip_embed, t5_embed = inputs
 
         # The following code taken and slightly modified from x-flux (https://github.com/XLabs-AI/x-flux/tree/main)
@@ -81,7 +81,12 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
         txt_ids = torch.zeros(bs, t5_embed.shape[1], 3).to(latents.device, latents.dtype)
 
         x_1 = latents
-        t = torch.sigmoid(torch.randn((bs,), device=latents.device))
+        if timestep_quantile is not None:
+            dist = torch.distributions.normal.Normal(0, 1)
+            logits_norm = dist.icdf(torch.full((bs,), timestep_quantile, device=latents.device))
+        else:
+            logits_norm = torch.randn((bs,), device=latents.device)
+        t = torch.sigmoid(logits_norm)
         x_0 = torch.randn_like(x_1)
         t_expanded = t.view(-1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0

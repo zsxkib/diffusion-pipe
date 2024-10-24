@@ -3,6 +3,8 @@ import os
 from datetime import datetime, timezone
 import shutil
 import glob
+import time
+import random
 
 import toml
 import deepspeed
@@ -10,11 +12,15 @@ from deepspeed.runtime.pipe import module as ds_pipe_module
 import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from utils import dataset as dataset_util
-from utils.common import is_main_process, DTYPE_MAP, empty_cuda_cache
+from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
+from utils.isolate_rng import isolate_rng
 from models import flux
+
+TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9, 0.9]
 
 CHECKPOINTABLE_LAYERS = [
     'TransformerWrapper',
@@ -64,6 +70,12 @@ def set_config_defaults(config):
         lora_config.setdefault('dtype', model_dtype_str)
         lora_config['dtype'] = DTYPE_MAP[lora_config['dtype']]
 
+    config.setdefault('eval_datasets', [])
+    config.setdefault('eval_gradient_accumulation_steps', 1)
+    config.setdefault('logging_steps', 1)
+    config.setdefault('eval_steps', None)
+    config.setdefault('eval_before_first_step', False)
+
 
 def get_most_recent_run_dir(output_dir):
     return list(sorted(glob.glob(os.path.join(output_dir, '*'))))[-1]
@@ -81,6 +93,65 @@ def print_model_info(model):
             print(p.device)
             print(p.requires_grad)
             print()
+
+
+def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_steps, quantile, pbar=None):
+    eval_dataloader.dataset.set_eval_quantile(quantile)
+    orig_micro_batches = model_engine.micro_batches
+    model_engine.micro_batches = eval_gradient_accumulation_steps
+    iterator = iter(eval_dataloader)
+    total_loss = 0
+    count = 0
+    while True:
+        model_engine.reset_activation_shape()
+        loss = model_engine.eval_batch(iterator).item()
+        eval_dataloader.sync_epoch()
+        if eval_dataloader.epoch == 2:
+            break
+        if pbar:
+            pbar.update(1)
+        total_loss += loss
+        count += 1
+
+    eval_dataloader.reset()
+    model_engine.micro_batches = orig_micro_batches
+    return total_loss / count
+
+
+def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
+    pbar_total = 0
+    for eval_dataloader in eval_dataloaders.values():
+        pbar_total += len(eval_dataloader) * len(TIMESTEP_QUANTILES_FOR_EVAL) // eval_gradient_accumulation_steps
+    if is_main_process():
+        print('Running eval')
+        pbar = tqdm(total=pbar_total)
+    else:
+        pbar = None
+
+    start = time.time()
+    for name, eval_dataloader in eval_dataloaders.items():
+        losses = []
+        for quantile in TIMESTEP_QUANTILES_FOR_EVAL:
+            loss = evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_steps, quantile, pbar=pbar)
+            losses.append(loss)
+            if is_main_process():
+                tb_writer.add_scalar(f'{name}/loss_quantile_{quantile:.2f}', loss, step)
+        avg_loss = sum(losses) / len(losses)
+        if is_main_process():
+            tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
+
+    duration = time.time() - start
+    if is_main_process():
+        tb_writer.add_scalar('eval/eval_time_sec', duration, step)
+        pbar.close()
+
+
+def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
+    with torch.no_grad(), isolate_rng():
+        seed = get_rank()
+        random.seed(seed)
+        torch.manual_seed(seed)
+        _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
 
 
 if __name__ == '__main__':
@@ -124,6 +195,20 @@ if __name__ == '__main__':
         dataset_config = toml.load(f)
     train_data = dataset_util.Dataset(dataset_config, model)
     dataset_manager.register(train_data)
+
+    eval_data_map = {}
+    for i, eval_dataset in enumerate(config['eval_datasets']):
+        if type(eval_dataset) == str:
+            name = f'eval{i}'
+            config_path = eval_dataset
+        else:
+            name = eval_dataset['name']
+            config_path = eval_dataset['config']
+        with open(config_path) as f:
+            eval_dataset_config = toml.load(f)
+        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model)
+        dataset_manager.register(eval_data_map[name])
+
     dataset_manager.cache()
 
     # if this is a new run, create a new dir for it
@@ -215,6 +300,13 @@ if __name__ == '__main__':
         model_engine.train_micro_batch_size_per_gpu(),
         model_engine.gradient_accumulation_steps(),
     )
+    for eval_data in eval_data_map.values():
+        eval_data.post_init(
+            model_engine.grid.get_data_parallel_rank(),
+            model_engine.grid.get_data_parallel_world_size(),
+            model_engine.train_micro_batch_size_per_gpu(),
+            config['eval_gradient_accumulation_steps'],
+        )
 
     # Might be useful because we set things in fp16 / bf16 without explicitly enabling Deepspeed fp16 mode.
     # Unsure if really needed.
@@ -226,10 +318,19 @@ if __name__ == '__main__':
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
     model_engine.total_steps = steps_per_epoch * config['epochs']
 
+    eval_dataloaders = {
+        name: dataset_util.PipelineDataLoader(eval_data, config['eval_gradient_accumulation_steps'])
+        for name, eval_data in eval_data_map.items()
+    }
+
     step = 1
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, peft_config, run_dir, model, train_dataloader, model_engine, pipeline_model)
+
+    # TODO: add resume_from_checkpoint to this condition when we add that feature.
+    if config['eval_before_first_step']:
+        evaluate(model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'])
 
     while True:
         #empty_cuda_cache()
@@ -237,9 +338,18 @@ if __name__ == '__main__':
         model_engine.reset_activation_shape()
         train_dataloader.sync_epoch()
 
+        # TODO: when we detect that we've started a new epoch, we've already taken the first training step for that
+        # epoch. So technically not correct, saving / eval is done with one extra step beyond the epoch. Does it even
+        # matter, and is it worth fixing?
         epoch = saver.process_epoch(epoch, step)
         if epoch is None:
             break
+
+        if is_main_process() and step % config['logging_steps'] == 0:
+            tb_writer.add_scalar(f'train/loss', loss.item(), step)
+
+        if config['eval_steps'] and step % config['eval_steps'] == 0:
+            evaluate(model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'])
 
         step += 1
 
