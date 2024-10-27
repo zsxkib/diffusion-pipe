@@ -10,7 +10,6 @@ from deepspeed import comm as dist
 import datasets
 from PIL import Image, ImageOps
 from datasets.fingerprint import Hasher
-from tqdm import tqdm
 
 from utils.common import zero_first, empty_cuda_cache, is_main_process
 
@@ -94,8 +93,8 @@ def process_image_fn(vae, size_bucket):
     return fn
 
 
-# Dataset that does caching, batching, and dividing batches across data parallel ranks.
-# Logically represents a single folder of images and captions on disk.
+# The smallest unit of a dataset. Represents a single size bucket from a single folder of images
+# and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
     def __init__(self, filepaths, dataset_config, size_bucket, model):
         logger.info(f'size_bucket: {size_bucket}, num_images: {len(filepaths)}')
@@ -161,36 +160,48 @@ class SizeBucketDataset:
     def __len__(self):
         return len(self.image_file_and_caption_dataset)
 
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
 
-
-class ConcatenatedDataset:
+# Logical concatenation of multiple SizeBucketDataset, for the same size bucket. It returns items
+# as batches.
+class ConcatenatedBatchedDataset:
     def __init__(self, datasets):
         self.datasets = datasets
+        self.post_init_called = False
         iteration_order = []
         for i, ds in enumerate(self.datasets):
             iteration_order.extend([i]*len(ds))
         shuffle_with_seed(iteration_order, 0)
+        cumulative_sums = [0] * len(self.datasets)
+        for k, dataset_idx in enumerate(iteration_order):
+            iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
+            cumulative_sums[dataset_idx] += 1
         self.iteration_order = iteration_order
 
-    def __len__(self):
-        return len(self.iteration_order)
+    def post_init(self, batch_size):
+        self.batch_size = batch_size
+        self._make_divisible_by(self.batch_size)
+        self.post_init_called = True
 
-    def __iter__(self):
-        iterators = [iter(ds) for ds in self.datasets]
-        for i in self.iteration_order:
-            yield next(iterators[i])
+    def __len__(self):
+        assert self.post_init_called
+        return len(self.iteration_order) // self.batch_size
+
+    def __getitem__(self, idx):
+        assert self.post_init_called
+        start = idx * self.batch_size
+        end = start + self.batch_size
+        return [self.datasets[i][j] for i, j in self.iteration_order[start:end]]
 
     def _make_divisible_by(self, n):
-        new_length = (len(self) // n) * n
+        new_length = (len(self.iteration_order) // n) * n
         self.iteration_order = self.iteration_order[:new_length]
         if new_length == 0 and is_main_process():
             logger.warning(f"size bucket {self.datasets[0].size_bucket} is being completely dropped because it doesn't have enough images")
 
-
-class Dataset(torch.utils.data.IterableDataset):
+# Outermost dataset object that the caller uses. Contains multiple ConcatenatedBatchedDataset. Responsible
+# for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
+# returned tuple of tensors is whatever the model needs.
+class Dataset:
     def __init__(self, dataset_config, model):
         super().__init__()
         self.model = model
@@ -222,47 +233,48 @@ class Dataset(torch.utils.data.IterableDataset):
 
         self.buckets = []
         for datasets in datasets_by_size_bucket.values():
-            self.buckets.append(ConcatenatedDataset(datasets))
+            self.buckets.append(ConcatenatedBatchedDataset(datasets))
 
     def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_world_size = data_parallel_world_size
         self.batch_size = per_device_batch_size * gradient_accumulation_steps
         self.global_batch_size = self.data_parallel_world_size * self.batch_size
-        self._make_divisible_by(self.global_batch_size)
+
+        for bucket in self.buckets:
+            bucket.post_init(self.global_batch_size)
+
+        iteration_order = []
+        for i, bucket in enumerate(self.buckets):
+            iteration_order.extend([i]*(len(bucket)))
+        shuffle_with_seed(iteration_order, 0)
+        cumulative_sums = [0] * len(self.buckets)
+        for k, dataset_idx in enumerate(iteration_order):
+            iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
+            cumulative_sums[dataset_idx] += 1
+        self.iteration_order = iteration_order
+        if DEBUG:
+            print(f'Dataset iteration_order: {self.iteration_order}')
+
         self.post_init_called = True
 
     def set_eval_quantile(self, quantile):
         self.eval_quantile = quantile
 
-    def _make_divisible_by(self, n):
-        for ds in self.buckets:
-            ds._make_divisible_by(n)
-        iteration_order = []
-        for i, bucket in enumerate(self.buckets):
-            iteration_order.extend([i]*(len(bucket) // n))
-        shuffle_with_seed(iteration_order, 0)
-        self.iteration_order = iteration_order
-        if DEBUG:
-            print(f'Dataset iteration_order: {self.iteration_order}')
-
     def __len__(self):
         assert self.post_init_called
         return len(self.iteration_order)
 
-    def __iter__(self):
+    def __getitem__(self, idx):
         assert self.post_init_called
-        iterators = [iter(bucket) for bucket in self.buckets]
-        for i in self.iteration_order:
-            iterator = iterators[i]
-            examples = [next(iterator) for _ in range(self.global_batch_size)]
-            batch = self._collate(examples)
-            start_idx = self.data_parallel_rank*self.batch_size
-            selector = slice(start_idx, start_idx + self.batch_size)
-            if DEBUG:
-                print(selector)
-            batch_for_this_dp_rank = tuple(x[selector] for x in batch)
-            yield self.model.prepare_inputs(batch_for_this_dp_rank, timestep_quantile=self.eval_quantile)
+        i, j = self.iteration_order[idx]
+        examples = self.buckets[i][j]
+        start_idx = self.data_parallel_rank*self.batch_size
+        examples_for_this_dp_rank = examples[start_idx:start_idx+self.batch_size]
+        if DEBUG:
+            print((start_idx, start_idx+self.batch_size))
+        batch =  self._collate(examples_for_this_dp_rank)
+        return self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
 
     def _collate(self, examples):
         return tuple(torch.stack(tensors, dim=0) for tensors in zip(*examples))
@@ -353,40 +365,55 @@ def split_batch(batch, pieces):
 
 # DataLoader that divides batches into microbatches for gradient accumulation steps when doing
 # pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
+# Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
 class PipelineDataLoader:
     def __init__(self, dataset, gradient_accumulation_steps):
         self.dataset = dataset
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.skip_first_n_batches = None
+        self.iter_called = False
         self.reset()
 
     def reset(self):
         self.epoch = 1
         self.num_batches_pulled = 0
-        self._create_dataloader()
+        self.next_micro_batch = None
 
     def __iter__(self):
+        self.iter_called = True
+        self._create_dataloader()
         return self
 
     def __len__(self):
         return len(self.dataset) * self.gradient_accumulation_steps
 
     def __next__(self):
+        if self.next_micro_batch == None:
+            self.next_micro_batch = next(self.data)
+        ret = self.next_micro_batch
         try:
-            micro_batch = next(self.data)
+            self.next_micro_batch = next(self.data)
         except StopIteration:
+            assert self.skip_first_n_batches is None
             self._create_dataloader()
-            micro_batch = next(self.data)
+            self.num_batches_pulled = 0
+            self.next_micro_batch = next(self.data)
             self.epoch += 1
-        return micro_batch
+        return ret
 
     def _create_dataloader(self):
+        if self.skip_first_n_batches is not None:
+            sampler = SkipFirstNSampler(self.skip_first_n_batches, len(self.dataset))
+            self.skip_first_n_batches = None
+        else:
+            sampler = None
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             pin_memory=True,
-            batch_size=None
+            batch_size=None,
+            sampler=sampler,
         )
         self.data = self._pull_batches_from_dataloader()
-        self.num_batches_pulled = 0
 
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
@@ -405,6 +432,34 @@ class PipelineDataLoader:
         for epoch in result:
             max_epoch = max(epoch, max_epoch)
         self.epoch = max_epoch
+
+    def state_dict(self):
+        return {
+            'epoch': self.epoch,
+            'num_batches_pulled': self.num_batches_pulled,
+        }
+
+    def load_state_dict(self, state_dict):
+        assert not self.iter_called
+        self.epoch = state_dict['epoch']
+        # -1 because by preloading the next micro_batch, it's always going to have one more batch
+        # pulled than the actual number of batches iterated by the caller.
+        self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
+        self.skip_first_n_batches = self.num_batches_pulled
+
+
+class SkipFirstNSampler(torch.utils.data.Sampler):
+    def __init__(self, n, dataset_length):
+        super().__init__()
+        self.n = n
+        self.dataset_length = dataset_length
+
+    def __len__(self):
+        return self.dataset_length
+
+    def __iter__(self):
+        for i in range(self.n, self.dataset_length):
+            yield i
 
 
 if __name__ == '__main__':
@@ -431,7 +486,7 @@ if __name__ == '__main__':
     dataset_manager.register(train_data)
     dataset_manager.cache()
 
-    train_data.post_init(data_parallel_rank=2, data_parallel_world_size=4, per_device_batch_size=1, gradient_accumulation_steps=1)
+    train_data.post_init(data_parallel_rank=0, data_parallel_world_size=1, per_device_batch_size=1, gradient_accumulation_steps=2)
     print(f'Dataset length: {len(train_data)}')
 
     for item in train_data:

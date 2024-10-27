@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import shutil
+import time
 
 import torch
 from deepspeed import comm as dist
@@ -12,6 +13,29 @@ from utils.common import is_main_process
 def convert_state_dict_dtype(state_dict, dtype):
     for key, v in state_dict.items():
         state_dict[key] = v.to(device='cpu', dtype=dtype)
+
+
+last_checkpoint_time = None
+def need_to_checkpoint(config, epoch=None):
+    if epoch is not None and 'checkpoint_every_n_epochs' in config and epoch % config['checkpoint_every_n_epochs'] == 0:
+        return True
+
+    if 'checkpoint_every_n_minutes' not in config:
+        return False
+
+    global last_checkpoint_time
+    checkpoint = False
+    # rank 0 tracks if we need to checkpoint, broadcasts to everyone else
+    if is_main_process():
+        current_time = time.time()
+        if last_checkpoint_time is None:
+            last_checkpoint_time = current_time
+        elif (current_time - last_checkpoint_time) / 60 > config['checkpoint_every_n_minutes']:
+            checkpoint = True
+            last_checkpoint_time = current_time
+    result = [checkpoint]
+    torch.distributed.broadcast_object_list(result, src=0)
+    return result[0]
 
 
 class Saver:
@@ -63,9 +87,21 @@ class Saver:
         else:
             self.save_full_model(name)
 
+    def save_checkpoint(self, step):
+        self.model_engine.save_checkpoint(
+            self.save_root,
+            client_state={
+                'step': step,
+                'custom_loader': self.train_dataloader.state_dict(),
+            },
+            save_latest=True,
+            exclude_frozen_parameters=True
+        )
+
     def process_epoch(self, epoch, step):
         if self.train_dataloader.epoch != epoch:
-            #self.save_checkpoint(step)
+            if need_to_checkpoint(self.config, epoch):
+                self.save_checkpoint(step)
             if epoch % self.config['save_every_n_epochs'] == 0:
                 if is_main_process():
                     print('Saving model')

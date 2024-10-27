@@ -20,7 +20,8 @@ import utils.saver
 from utils.isolate_rng import isolate_rng
 from models import flux
 
-TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9, 0.9]
+#TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9, 0.9]
+TIMESTEP_QUANTILES_FOR_EVAL = [0.5]
 
 CHECKPOINTABLE_LAYERS = [
     'TransformerWrapper',
@@ -74,7 +75,8 @@ def set_config_defaults(config):
     config.setdefault('eval_gradient_accumulation_steps', 1)
     config.setdefault('logging_steps', 1)
     config.setdefault('eval_steps', None)
-    config.setdefault('eval_before_first_step', False)
+    config.setdefault('eval_epochs', None)
+    config.setdefault('eval_before_first_step', True)
 
 
 def get_most_recent_run_dir(output_dir):
@@ -106,12 +108,12 @@ def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_st
         model_engine.reset_activation_shape()
         loss = model_engine.eval_batch(iterator).item()
         eval_dataloader.sync_epoch()
-        if eval_dataloader.epoch == 2:
-            break
         if pbar:
             pbar.update(1)
         total_loss += loss
         count += 1
+        if eval_dataloader.epoch == 2:
+            break
 
     eval_dataloader.reset()
     model_engine.micro_batches = orig_micro_batches
@@ -147,6 +149,8 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
 
 
 def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
+    if len(eval_dataloaders) == 0:
+        return
     with torch.no_grad(), isolate_rng():
         seed = get_rank()
         random.seed(seed)
@@ -314,6 +318,29 @@ if __name__ == '__main__':
     model_engine.communication_data_type = communication_data_type
 
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine.gradient_accumulation_steps())
+
+    step = 1
+    # make sure to do this before calling model_engine.set_dataloader(), as that method creates an iterator
+    # which starts creating dataloader internal state
+    if resume_from_checkpoint:
+        load_path, client_state = model_engine.load_checkpoint(
+            run_dir,
+            load_module_strict=False,
+            load_lr_scheduler_states='force_constant_lr' not in config,
+        )
+        deepspeed.comm.barrier()  # just so the print below doesn't get swamped
+        assert load_path is not None
+        train_dataloader.load_state_dict(client_state['custom_loader'])
+        step = client_state['step'] + 1
+        del client_state
+        if is_main_process():
+            print(f'Resuming training from checkpoint. Resuming at epoch: {train_dataloader.epoch}, step: {step}')
+
+    if 'force_constant_lr' in config:
+        model_engine.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+        for pg in optimizer.param_groups:
+            pg['lr'] = config['force_constant_lr']
+
     model_engine.set_dataloader(train_dataloader)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
     model_engine.total_steps = steps_per_epoch * config['epochs']
@@ -323,34 +350,32 @@ if __name__ == '__main__':
         for name, eval_data in eval_data_map.items()
     }
 
-    step = 1
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, peft_config, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
-    # TODO: add resume_from_checkpoint to this condition when we add that feature.
-    if config['eval_before_first_step']:
+    if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'])
 
     while True:
         #empty_cuda_cache()
-        loss = model_engine.train_batch()
         model_engine.reset_activation_shape()
+        loss = model_engine.train_batch()
         train_dataloader.sync_epoch()
 
-        # TODO: when we detect that we've started a new epoch, we've already taken the first training step for that
-        # epoch. So technically not correct, saving / eval is done with one extra step beyond the epoch. Does it even
-        # matter, and is it worth fixing?
-        epoch = saver.process_epoch(epoch, step)
-        if epoch is None:
-            break
+        new_epoch = saver.process_epoch(epoch, step)
+        finished_epoch = True if new_epoch != epoch else False
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss.item(), step)
 
-        if config['eval_steps'] and step % config['eval_steps'] == 0:
+        if (config['eval_steps'] and step % config['eval_steps'] == 0) or (finished_epoch and config['eval_epochs'] and epoch % config['eval_epochs'] == 0):
             evaluate(model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'])
 
+        if finished_epoch:
+            epoch = new_epoch
+            if epoch is None:
+                break
         step += 1
 
     if is_main_process():
