@@ -4,12 +4,11 @@ import random
 from collections import defaultdict
 
 import torch
-from torchvision import transforms
 from deepspeed.utils.logging import logger
 from deepspeed import comm as dist
 import datasets
-from PIL import Image, ImageOps
 from datasets.fingerprint import Hasher
+from PIL import Image
 
 from utils.common import zero_first, empty_cuda_cache, is_main_process
 
@@ -22,44 +21,6 @@ def shuffle_with_seed(l, seed=None):
     random.seed(seed)
     random.shuffle(l)
     random.setstate(rng_state)
-
-
-def crop_and_resize(pil_img, size_bucket):
-    if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
-        pil_img = pil_img.convert('RGBA')
-
-    # add white background for transparent images
-    if pil_img.mode == 'RGBA':
-        canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
-        canvas.alpha_composite(pil_img)
-        pil_img = canvas.convert('RGB')
-    else:
-        pil_img = pil_img.convert('RGB')
-
-    return ImageOps.fit(pil_img, size_bucket)
-
-
-pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-def encode_pil_to_latents(pil_img, vae):
-    img = pil_to_tensor(pil_img)
-    img = img.unsqueeze(0)
-    latents = vae.encode(img.to(vae.device, vae.dtype)).latent_dist.sample()
-    if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
-        latents = latents - vae.config.shift_factor
-    latents = latents * vae.config.scaling_factor
-    latents = latents.to('cpu')
-    return latents
-
-
-tensor_to_pil = transforms.Compose([transforms.Lambda(lambda x: (x / 2 + 0.5).clamp(0, 1)), transforms.ToPILImage()])
-def decode_latents_to_pil(latents, vae):
-    latents = latents.to(vae.device)
-    latents = latents / vae.config.scaling_factor
-    if hasattr(vae.config, 'shift_factor'):
-        latents = latents + vae.config.shift_factor
-    img = vae.decode(latents.to(vae.dtype), return_dict=False)[0].to(torch.float32)
-    img = img.squeeze(0)
-    return tensor_to_pil(img)
 
 
 def process_caption_fn(shuffle_tags=False, caption_prefix=''):
@@ -77,22 +38,6 @@ def process_caption_fn(shuffle_tags=False, caption_prefix=''):
     return fn
 
 
-def process_image_fn(vae, size_bucket):
-    def fn(example):
-        image_file = example['image_file']
-        try:
-            pil_img = Image.open(image_file)
-        except Exception:
-            logger.warning(f'Image file {image_file} could not be opened. Skipping.')
-            return None
-        pil_img = crop_and_resize(pil_img, size_bucket)
-        latents = encode_pil_to_latents(pil_img, vae)
-
-        example['latents'] = latents.squeeze(0)
-        return example
-    return fn
-
-
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
@@ -106,7 +51,7 @@ class SizeBucketDataset:
         self.model = model
         self.path = Path(self.config['path'])
         self.cache_dir = self.path / 'cache' / f'cache_{size_bucket[0]}x{size_bucket[1]}'
-        self.text_embedding_datasets = []
+        self.datasets = []
 
         os.makedirs(self.cache_dir, exist_ok=True)
         image_and_caption_files = self.filepaths
@@ -131,31 +76,19 @@ class SizeBucketDataset:
             for existing_cache_file in self.cache_dir.glob(f'{cache_file_prefix}*.arrow'):
                 existing_cache_file.unlink()
         # lower writer_batch_size from the default of 1000 or we get a weird pyarrow overflow error
-        dataset = dataset.map(map_fn, cache_file_name=str(cache_file), writer_batch_size=100, new_fingerprint=new_fingerprint)
+        dataset = dataset.map(map_fn, cache_file_name=str(cache_file), writer_batch_size=100, new_fingerprint=new_fingerprint, remove_columns=dataset.column_names)
         return dataset
 
-    def _get_text_embedding_map_fn(self, i):
-        def fn(example):
-            example[f'text_embedding'] = self.model.get_text_embedding(i, example['caption']).to('cpu').squeeze(0)
-            return example
-        return fn
+    def _cache_data_for_module(self, module, i):
+        self.datasets.append(self._map_and_cache(self.image_file_and_caption_dataset, self.model.get_dataset_map_fn(module, self.size_bucket), cache_file_prefix=f'module_{i}_', new_fingerprint_args=[i]))
 
-    # TODO: just like the model is responsible for implementing a method to get the text embedding for a caption, it should probably also
-    # have a method to get the latents from an image, rather than having the code for that in this file.
-    def _cache_latents(self, vae):
-        with torch.no_grad():
-            self.latent_dataset = self._map_and_cache(self.image_file_and_caption_dataset, process_image_fn(vae, self.size_bucket), cache_file_prefix='latent_')
-
-    def _cache_text_embedding(self, i):
-        with torch.no_grad():
-            self.text_embedding_datasets.append(self._map_and_cache(self.image_file_and_caption_dataset, self._get_text_embedding_map_fn(i), cache_file_prefix=f'text_embedding_{i+1}_', new_fingerprint_args=[i]))
-
-    def __getitem__(self, i):
+    def __getitem__(self, idx):
         if DEBUG:
-            print(Path(self.image_file_and_caption_dataset[i]['image_file']).stem)
-        latents = self.latent_dataset[i]['latents']
-        text_embeddings = [te_dataset[i]['text_embedding'] for te_dataset in self.text_embedding_datasets]
-        return latents, *text_embeddings
+            print(Path(self.image_file_and_caption_dataset[idx]['image_file']).stem)
+        ret = {}
+        for ds in self.datasets:
+            ret.update(ds[idx])
+        return ret
 
     def __len__(self):
         return len(self.image_file_and_caption_dataset)
@@ -176,6 +109,7 @@ class ConcatenatedBatchedDataset:
             iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
             cumulative_sums[dataset_idx] += 1
         self.iteration_order = iteration_order
+        assert len(self.iteration_order) > 0, 'ConcatenatedBatchedDataset is empty. Are your file paths correct?'
 
     def post_init(self, batch_size):
         self.batch_size = batch_size
@@ -276,8 +210,12 @@ class Dataset:
         batch =  self._collate(examples_for_this_dp_rank)
         return self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
 
+    # collates a list of dictionaries of tensors into a single dictionary of batched tensors
     def _collate(self, examples):
-        return tuple(torch.stack(tensors, dim=0) for tensors in zip(*examples))
+        ret = {}
+        for key in examples[0].keys():
+            ret[key] = torch.stack([example[key] for example in examples])
+        return ret
 
     def _split_into_size_buckets(self, path, size_buckets):
         size_bucket_to_filepaths = defaultdict(list)
@@ -337,20 +275,12 @@ class DatasetManager:
 
     @torch.no_grad()
     def _cache(self):
-        vae = self.model.get_vae()
-        if is_main_process():
-            vae.to('cuda')
-        for ds in self.datasets:
-            ds._cache_latents(vae)
-        vae.to('cpu')
-        empty_cuda_cache()
-
-        for i, text_encoder in enumerate(self.model.get_text_encoders()):
+        for i, module in enumerate(self.model.get_modules()):
             if is_main_process():
-                text_encoder.to('cuda')
+                module.to('cuda')
             for ds in self.datasets:
-                ds._cache_text_embedding(i)
-            text_encoder.to('cpu')
+                ds._cache_data_for_module(module, i)
+            module.to('cpu')
             empty_cuda_cache()
 
 

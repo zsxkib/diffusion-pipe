@@ -20,8 +20,7 @@ import utils.saver
 from utils.isolate_rng import isolate_rng
 from models import flux
 
-#TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9, 0.9]
-TIMESTEP_QUANTILES_FOR_EVAL = [0.5]
+TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9, 0.9]
 
 CHECKPOINTABLE_LAYERS = [
     'TransformerWrapper',
@@ -170,18 +169,12 @@ if __name__ == '__main__':
 
     deepspeed.init_distributed()
 
-    model_config = config['model']
-    model_type = model_config['type']
+    model_type = config['model']['type']
 
     if model_type == 'flux':
-        model = flux.CustomFluxPipeline.from_pretrained(model_config['path'], torch_dtype=model_config['dtype'])
+        model = flux.CustomFluxPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
-
-    # TODO: don't directly inherit from diffusers.FluxPipeline, just make a new class and use composition, so we don't
-    # need to set this attribute after creating the object.
-    model.model_config = model_config
-    model.transformer.train()
 
     # import sys, PIL
     # test_image = sys.argv[1]

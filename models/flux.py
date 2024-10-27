@@ -4,22 +4,76 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
+from torchvision import transforms
+from PIL import Image, ImageOps
+from deepspeed.utils.logging import logger
 
 
-class CustomFluxPipeline(diffusers.FluxPipeline):
-    def get_vae(self):
-        return self.vae
+def crop_and_resize(pil_img, size_bucket):
+    if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
+        pil_img = pil_img.convert('RGBA')
 
-    def get_text_encoders(self):
-        return self.text_encoder, self.text_encoder_2
+    # add white background for transparent images
+    if pil_img.mode == 'RGBA':
+        canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
+        canvas.alpha_composite(pil_img)
+        pil_img = canvas.convert('RGB')
+    else:
+        pil_img = pil_img.convert('RGB')
 
-    def get_text_embedding(self, i, prompt):
-        if i == 0:
-            return self._get_clip_prompt_embeds(prompt=prompt, device=self.text_encoder.device)
-        elif i == 1:
-            return self._get_t5_prompt_embeds(prompt=prompt, device=self.text_encoder_2.device)
-        else:
-            raise ValueError(f'This model does not have a text encoder for index {i}')
+    return ImageOps.fit(pil_img, size_bucket)
+
+
+pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+def encode_pil_to_latents(pil_img, vae):
+    img = pil_to_tensor(pil_img)
+    img = img.unsqueeze(0)
+    latents = vae.encode(img.to(vae.device, vae.dtype)).latent_dist.sample()
+    if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
+        latents = latents - vae.config.shift_factor
+    latents = latents * vae.config.scaling_factor
+    latents = latents.to('cpu')
+    return latents
+
+
+tensor_to_pil = transforms.Compose([transforms.Lambda(lambda x: (x / 2 + 0.5).clamp(0, 1)), transforms.ToPILImage()])
+def decode_latents_to_pil(latents, vae):
+    latents = latents.to(vae.device)
+    latents = latents / vae.config.scaling_factor
+    if hasattr(vae.config, 'shift_factor'):
+        latents = latents + vae.config.shift_factor
+    img = vae.decode(latents.to(vae.dtype), return_dict=False)[0].to(torch.float32)
+    img = img.squeeze(0)
+    return tensor_to_pil(img)
+
+
+def process_image_fn(vae, size_bucket):
+    def fn(example):
+        image_file = example['image_file']
+        try:
+            pil_img = Image.open(image_file)
+        except Exception:
+            logger.warning(f'Image file {image_file} could not be opened. Skipping.')
+            return None
+        pil_img = crop_and_resize(pil_img, size_bucket)
+        latents = encode_pil_to_latents(pil_img, vae)
+
+        return {'latents': latents.squeeze(0)}
+    return fn
+
+
+class CustomFluxPipeline:
+    def __init__(self, config):
+        self.config = config
+        self.model_config = self.config['model']
+        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['path'], torch_dtype=self.model_config['dtype'])
+        self.transformer.train()
+
+    def __getattr__(self, name):
+        return getattr(self.diffusers_pipeline, name)
+
+    def get_modules(self):
+        return self.vae, self.text_encoder, self.text_encoder_2
 
     def inject_lora_layers(self, lora_config):
         # TODO: I yoinked this list from SimpleTuner. Need to read the flux code and make sure I
@@ -70,8 +124,24 @@ class CustomFluxPipeline(diffusers.FluxPipeline):
     def save_lora(self, save_dir, peft_state_dict):
         self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
 
+    def get_dataset_map_fn(self, module, size_bucket):
+        if module == self.vae:
+            return process_image_fn(module, size_bucket)
+        elif module == self.text_encoder:
+            def fn(example):
+                return {'clip_embed': self._get_clip_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu').squeeze(0)}
+            return fn
+        elif module == self.text_encoder_2:
+            def fn(example):
+                return {'t5_embed': self._get_t5_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu').squeeze(0)}
+            return fn
+        else:
+            raise RuntimeError(f'Module {module.__class__} does not have a map fn implemented')
+
     def prepare_inputs(self, inputs, timestep_quantile=None):
-        latents, clip_embed, t5_embed = inputs
+        latents = inputs['latents']
+        clip_embed = inputs['clip_embed']
+        t5_embed = inputs['t5_embed']
 
         # The following code taken and slightly modified from x-flux (https://github.com/XLabs-AI/x-flux/tree/main)
         bs, c, h, w = latents.shape
