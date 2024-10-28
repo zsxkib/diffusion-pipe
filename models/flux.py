@@ -76,7 +76,16 @@ class CustomFluxPipeline:
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
-        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['path'], torch_dtype=self.model_config['dtype'])
+        kwargs = {}
+        if 'transformer' in self.model_config:
+            transformer = diffusers.FluxTransformer2DModel.from_single_file(
+                self.model_config['transformer'],
+                torch_dtype=self.model_config['dtype'],
+                config='configs/flux_dev_config.json',
+                local_files_only=True,
+            )
+            kwargs['transformer'] = transformer
+        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=self.model_config['dtype'], **kwargs)
         self.transformer.train()
 
     def __getattr__(self, name):
