@@ -50,7 +50,7 @@ class SizeBucketDataset:
         self.size_bucket = size_bucket
         self.model = model
         self.path = Path(self.config['path'])
-        self.cache_dir = self.path / 'cache' / f'cache_{size_bucket[0]}x{size_bucket[1]}'
+        self.cache_dir = self.path / 'cache' / self.model.name / f'cache_{size_bucket[0]}x{size_bucket[1]}'
         self.datasets = []
 
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -226,7 +226,7 @@ class Dataset:
         # deterministic order
         files.sort()
         for file in files:
-            if not file.is_file() or file.suffix == '.txt':
+            if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz':
                 continue
             image_file = file
             caption_file = image_file.with_suffix('.txt')

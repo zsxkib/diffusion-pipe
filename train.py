@@ -248,14 +248,14 @@ if __name__ == '__main__':
             #     lr=lr,
             #     betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
             #     weight_decay=optim_config.get('weight_decay', 0.01),
-            #     eps=optim_config.get('eps', 1e-6)
+            #     eps=optim_config.get('eps', 1e-8)
             # )
             return torch.optim.AdamW(
                 model_parameters,
                 lr=lr,
                 betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
                 weight_decay=optim_config.get('weight_decay', 0.01),
-                eps=optim_config.get('eps', 1e-6)
+                eps=optim_config.get('eps', 1e-8)
             )
         elif optim_type == 'adamw8bit':
             return bitsandbytes.optim.AdamW8bit(
@@ -263,7 +263,7 @@ if __name__ == '__main__':
                 lr=lr,
                 betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
                 weight_decay=optim_config.get('weight_decay', 0.01),
-                eps=optim_config.get('eps', 1e-6)
+                eps=optim_config.get('eps', 1e-8)
             )
         elif optim_type == 'adamw_kahan':
             import optimi
@@ -273,7 +273,7 @@ if __name__ == '__main__':
                 betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
                 weight_decay=optim_config.get('weight_decay', 0.01),
                 kahan_sum=optim_config.get('kahan_sum', True),
-                eps=optim_config.get('eps', 1e-6)
+                eps=optim_config.get('eps', 1e-8)
             )
         else:
             raise NotImplementedError(optim_type)

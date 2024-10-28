@@ -76,6 +76,9 @@ def is_dev(safetensors_path):
 
 
 class CustomFluxPipeline:
+    # Unique name, used to make the cache_dir path.
+    name = 'flux'
+
     # layers that will participate in activation checkpointing
     checkpointable_layers = [
         'TransformerWrapper',
@@ -165,6 +168,9 @@ class CustomFluxPipeline:
         latents = rearrange(latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
 
         img_ids = self._prepare_latent_image_ids(bs, h, w, latents.device, latents.dtype)
+        if img_ids.ndim == 2:
+            # This method must return tensors with batch dimension, since we proceed to split along batch dimension for pipelining.
+            img_ids = img_ids.unsqueeze(0).repeat((bs, 1, 1))
         txt_ids = torch.zeros(bs, t5_embed.shape[1], 3).to(latents.device, latents.dtype)
 
         x_1 = latents
@@ -222,9 +228,13 @@ class EmbeddingWrapper(nn.Module):
         else:
             temb = self.time_text_embed(timestep, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-        ids = torch.cat((txt_ids, img_ids), dim=1)
-        image_rotary_emb = self.pos_embed(ids)
-        return hidden_states, encoder_hidden_states, temb, image_rotary_emb, target
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        freqs_cos, freqs_sin = self.pos_embed(ids)
+        return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target
 
 
 class TransformerWrapper(nn.Module):
@@ -233,20 +243,20 @@ class TransformerWrapper(nn.Module):
         self.block = block
 
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, image_rotary_emb, target = inputs
+        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target = inputs
         encoder_hidden_states, hidden_states = self.block(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             temb=temb,
-            image_rotary_emb=image_rotary_emb,
+            image_rotary_emb=(freqs_cos, freqs_sin),
         )
-        return hidden_states, encoder_hidden_states, temb, image_rotary_emb, target
+        return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target
 
 
 def concatenate_hidden_states(inputs):
-    hidden_states, encoder_hidden_states, temb, image_rotary_emb, target = inputs
+    hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target = inputs
     hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
-    return hidden_states, encoder_hidden_states, temb, image_rotary_emb, target
+    return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target
 
 
 class SingleTransformerWrapper(nn.Module):
@@ -255,13 +265,13 @@ class SingleTransformerWrapper(nn.Module):
         self.block = block
 
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, image_rotary_emb, target = inputs
+        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target = inputs
         hidden_states = self.block(
             hidden_states=hidden_states,
             temb=temb,
-            image_rotary_emb=image_rotary_emb,
+            image_rotary_emb=(freqs_cos, freqs_sin),
         )
-        return hidden_states, encoder_hidden_states, temb, image_rotary_emb, target
+        return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target
 
 
 class OutputWrapper(nn.Module):
@@ -271,7 +281,7 @@ class OutputWrapper(nn.Module):
         self.proj_out = proj_out
 
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, image_rotary_emb, target = inputs
+        hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target = inputs
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
