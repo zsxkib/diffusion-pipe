@@ -1,3 +1,5 @@
+import math
+
 import diffusers
 import peft
 import torch
@@ -73,6 +75,16 @@ def is_dev(safetensors_path):
             if key.startswith('guidance_in'):
                 return True
     return False
+
+
+def time_shift(mu: float, sigma: float, t: torch.Tensor):
+    return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
+
+
+def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15):
+    m = (y2 - y1) / (x2 - x1)
+    b = y1 - m * x1
+    return lambda x: m * x + b
 
 
 class CustomFluxPipeline:
@@ -173,13 +185,22 @@ class CustomFluxPipeline:
             img_ids = img_ids.unsqueeze(0).repeat((bs, 1, 1))
         txt_ids = torch.zeros(bs, t5_embed.shape[1], 3).to(latents.device, latents.dtype)
 
-        x_1 = latents
         if timestep_quantile is not None:
             dist = torch.distributions.normal.Normal(0, 1)
             logits_norm = dist.icdf(torch.full((bs,), timestep_quantile, device=latents.device))
         else:
             logits_norm = torch.randn((bs,), device=latents.device)
+
+        sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
+        logits_norm = logits_norm * sigmoid_scale
         t = torch.sigmoid(logits_norm)
+        if shift := self.model_config.get('shift', None):
+            t = (t * shift) / (1 + (shift - 1) * t)
+        elif self.model_config.get('flux_shift', False):
+            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            t = time_shift(mu, 1.0, t)
+
+        x_1 = latents
         x_0 = torch.randn_like(x_1)
         t_expanded = t.view(-1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
