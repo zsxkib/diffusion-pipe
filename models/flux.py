@@ -63,6 +63,12 @@ def process_image_fn(vae, size_bucket):
 
 
 class CustomFluxPipeline:
+    # layers that will participate in activation checkpointing
+    checkpointable_layers = [
+        'TransformerWrapper',
+        'SingleTransformerWrapper',
+    ]
+
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
@@ -75,7 +81,7 @@ class CustomFluxPipeline:
     def get_modules(self):
         return self.vae, self.text_encoder, self.text_encoder_2
 
-    def inject_lora_layers(self, lora_config):
+    def configure_adapter(self, adapter_config):
         # TODO: I yoinked this list from SimpleTuner. Need to read the flux code and make sure I
         # agree this is correct and covers all Linear layers.
         # all
@@ -106,23 +112,32 @@ class CustomFluxPipeline:
             "proj_mlp",
             "proj_out",
         ]
-        peft_config = peft.LoraConfig(
-            r=lora_config['rank'],
-            lora_alpha=lora_config['alpha'],
-            lora_dropout=lora_config['dropout'],
-            bias='none',
-            target_modules=target_modules
-        )
+
+        adapter_type = adapter_config['type']
+        if adapter_type == 'lora':
+            peft_config = peft.LoraConfig(
+                r=adapter_config['rank'],
+                lora_alpha=adapter_config['alpha'],
+                lora_dropout=adapter_config['dropout'],
+                bias='none',
+                target_modules=target_modules
+            )
+        else:
+            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
         #lora_model = peft.get_peft_model(self.transformer, peft_config)
         self.transformer.add_adapter(peft_config)
         for name, p in self.transformer.named_parameters():
             p.original_name = name
             if p.requires_grad:
-                p.data = p.data.to(lora_config['dtype'])
+                p.data = p.data.to(adapter_config['dtype'])
         return peft_config
 
-    def save_lora(self, save_dir, peft_state_dict):
-        self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
+    def save_adapter(self, save_dir, peft_state_dict):
+        adapter_type = self.config['adapter']['type']
+        if adapter_type == 'lora':
+            self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
+        else:
+            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
 
     def get_dataset_map_fn(self, module, size_bucket):
         if module == self.vae:

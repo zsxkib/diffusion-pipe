@@ -49,7 +49,7 @@ class Saver:
         self.model_engine = model_engine
         self.pipeline_model = pipeline_model
 
-    def save_lora(self, name):
+    def save_adapter(self, name):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
         stage_id = self.model_engine.grid.get_pipe_parallel_rank()
         save_dir = self.save_root / name
@@ -64,6 +64,7 @@ class Saver:
                     if not hasattr(p, 'original_name'):
                         logger.warning(f'WARNING: parameter {name} requires_grad but does not have original_name. Not saving it.')
                         continue
+                    # TODO: maybe this needs to change if we ever have non-lora adapters?
                     partial_state_dict[p.original_name.replace('.default', '').replace('.modules_to_save', '')] = p.detach()
                     if 'save_dtype' in self.config:
                         convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
@@ -73,7 +74,7 @@ class Saver:
             state_dict = {}
             for path in tmp_dir.glob('*.bin'):
                 state_dict.update(torch.load(path, weights_only=True, map_location='cpu'))
-            self.model.save_lora(save_dir, state_dict)
+            self.model.save_adapter(save_dir, state_dict)
             shutil.copy(self.args.config, save_dir)
             shutil.copy(self.args.deepspeed_config, save_dir)
             shutil.rmtree(tmp_dir)
@@ -83,7 +84,7 @@ class Saver:
 
     def save_model(self, name):
         if self.peft_config is not None:
-            self.save_lora(name)
+            self.save_adapter(name)
         else:
             self.save_full_model(name)
 

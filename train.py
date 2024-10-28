@@ -22,11 +22,6 @@ from models import flux
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9, 0.9]
 
-CHECKPOINTABLE_LAYERS = [
-    'TransformerWrapper',
-    'SingleTransformerWrapper',
-]
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--config', help='Path to TOML configuration file.')
 parser.add_argument('--local_rank', type=int, default=-1,
@@ -51,9 +46,11 @@ ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
 
 
 def set_config_defaults(config):
+    # Force the user to set this. If we made it a default of 1, it might use a lot of disk space.
+    assert 'save_every_n_epochs' in config
+
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
-    config.setdefault('save_every_n_epochs', 1)
     config.setdefault('warmup_steps', 0)
     if 'save_dtype' in config:
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
@@ -63,16 +60,20 @@ def set_config_defaults(config):
     model_config['dtype'] = DTYPE_MAP[model_dtype_str]
     model_config.setdefault('guidance', 1.0)
 
-    if 'lora' in config:
-        lora_config = config['lora']
-        lora_config.setdefault('alpha', lora_config['rank'])
-        lora_config.setdefault('dropout', 0.0)
-        lora_config.setdefault('dtype', model_dtype_str)
-        lora_config['dtype'] = DTYPE_MAP[lora_config['dtype']]
+    if 'adapter' in config:
+        adapter_config = config['adapter']
+        adapter_type = adapter_config['type']
+        if adapter_config['type'] == 'lora':
+            adapter_config.setdefault('alpha', adapter_config['rank'])
+            adapter_config.setdefault('dropout', 0.0)
+            adapter_config.setdefault('dtype', model_dtype_str)
+            adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
+        else:
+            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
 
+    config.setdefault('logging_steps', 1)
     config.setdefault('eval_datasets', [])
     config.setdefault('eval_gradient_accumulation_steps', 1)
-    config.setdefault('logging_steps', 1)
     config.setdefault('eval_steps', None)
     config.setdefault('eval_epochs', None)
     config.setdefault('eval_before_first_step', True)
@@ -185,7 +186,7 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    peft_config = model.inject_lora_layers(config['lora'])
+    peft_config = model.configure_adapter(config['adapter'])
 
     dataset_manager = dataset_util.DatasetManager(model)
     with open(config['dataset']) as f:
@@ -224,7 +225,7 @@ if __name__ == '__main__':
         checkpoint_func = deepspeed.checkpointing.checkpoint
         additional_pipeline_module_kwargs.update({
             'activation_checkpoint_interval': 1,
-            'checkpointable_layers': CHECKPOINTABLE_LAYERS,
+            'checkpointable_layers': model.checkpointable_layers,
             'activation_checkpoint_func': checkpoint_func,
         })
     pipeline_model = deepspeed.pipe.PipelineModule(
