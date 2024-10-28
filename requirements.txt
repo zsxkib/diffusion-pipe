@@ -10,3 +10,4 @@ peft
 torch-optimi
 tensorboard
 tqdm
+safetensors

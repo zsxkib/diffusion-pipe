@@ -7,6 +7,7 @@ from einops import rearrange
 from torchvision import transforms
 from PIL import Image, ImageOps
 from deepspeed.utils.logging import logger
+from safetensors import safe_open
 
 from utils.common import is_main_process
 
@@ -66,6 +67,14 @@ def process_image_fn(vae, size_bucket):
     return fn
 
 
+def is_dev(safetensors_path):
+    with safe_open(safetensors_path, framework='pt', device='cpu') as f:
+        for key in f.keys():
+            if key.startswith('guidance_in'):
+                return True
+    return False
+
+
 class CustomFluxPipeline:
     # layers that will participate in activation checkpointing
     checkpointable_layers = [
@@ -77,11 +86,12 @@ class CustomFluxPipeline:
         self.config = config
         self.model_config = self.config['model']
         kwargs = {}
-        if 'transformer' in self.model_config:
+        if transformer_path := self.model_config.get('transformer', None):
+            transformer_config = 'configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
             transformer = diffusers.FluxTransformer2DModel.from_single_file(
                 self.model_config['transformer'],
                 torch_dtype=self.model_config['dtype'],
-                config='configs/flux_dev_config.json',
+                config=transformer_config,
                 local_files_only=True,
             )
             kwargs['transformer'] = transformer
@@ -204,10 +214,13 @@ class EmbeddingWrapper(nn.Module):
             item.requires_grad_(True)
         hidden_states, encoder_hidden_states, pooled_projections, timestep, img_ids, txt_ids, guidance, target = inputs
         hidden_states = self.x_embedder(hidden_states)
-        # Note: we only do the code path where guidance != None. Not sure why the other path even exists, we always have a guidance vector.
         timestep = timestep.to(hidden_states.dtype) * 1000
         guidance = guidance.to(hidden_states.dtype) * 1000
-        temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        # handle dev vs schnell
+        if self.time_text_embed.__class__.__name__ == 'CombinedTimestepGuidanceTextProjEmbeddings':
+            temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = self.time_text_embed(timestep, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
         ids = torch.cat((txt_ids, img_ids), dim=1)
         image_rotary_emb = self.pos_embed(ids)
