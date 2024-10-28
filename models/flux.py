@@ -8,6 +8,10 @@ from torchvision import transforms
 from PIL import Image, ImageOps
 from deepspeed.utils.logging import logger
 
+from utils.common import is_main_process
+
+ADAPTER_TARGET_MODULES = ['FluxTransformerBlock', 'FluxSingleTransformerBlock']
+
 
 def crop_and_resize(pil_img, size_bucket):
     if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
@@ -82,36 +86,13 @@ class CustomFluxPipeline:
         return self.vae, self.text_encoder, self.text_encoder_2
 
     def configure_adapter(self, adapter_config):
-        # TODO: I yoinked this list from SimpleTuner. Need to read the flux code and make sure I
-        # agree this is correct and covers all Linear layers.
-        # all
-        # target_modules = [
-        #     "to_k",
-        #     "to_q",
-        #     "to_v",
-        #     "add_k_proj",
-        #     "add_q_proj",
-        #     "add_v_proj",
-        #     "to_out.0",
-        #     "to_add_out",
-        # ]
-        # all+ffs
-        target_modules = [
-            "to_k",
-            "to_q",
-            "to_v",
-            "add_k_proj",
-            "add_q_proj",
-            "add_v_proj",
-            "to_out.0",
-            "to_add_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "ff_context.net.0.proj",
-            "ff_context.net.2",
-            "proj_mlp",
-            "proj_out",
-        ]
+        target_linear_modules = []
+        for module in self.transformer.modules():
+            if module.__class__.__name__ not in ADAPTER_TARGET_MODULES:
+                continue
+            for name, submodule in module.named_modules():
+                if isinstance(submodule, nn.Linear):
+                    target_linear_modules.append(name)
 
         adapter_type = adapter_config['type']
         if adapter_type == 'lora':
@@ -120,12 +101,14 @@ class CustomFluxPipeline:
                 lora_alpha=adapter_config['alpha'],
                 lora_dropout=adapter_config['dropout'],
                 bias='none',
-                target_modules=target_modules
+                target_modules=target_linear_modules
             )
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-        #lora_model = peft.get_peft_model(self.transformer, peft_config)
-        self.transformer.add_adapter(peft_config)
+        lora_model = peft.get_peft_model(self.transformer, peft_config)
+        #self.transformer.add_adapter(peft_config)
+        if is_main_process():
+            lora_model.print_trainable_parameters()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
             if p.requires_grad:
