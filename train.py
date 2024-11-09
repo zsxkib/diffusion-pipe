@@ -74,8 +74,8 @@ def set_config_defaults(config):
     config.setdefault('logging_steps', 1)
     config.setdefault('eval_datasets', [])
     config.setdefault('eval_gradient_accumulation_steps', 1)
-    config.setdefault('eval_steps', None)
-    config.setdefault('eval_epochs', None)
+    config.setdefault('eval_every_n_steps', None)
+    config.setdefault('eval_every_n_epochs', None)
     config.setdefault('eval_before_first_step', True)
 
 
@@ -231,7 +231,7 @@ if __name__ == '__main__':
     pipeline_model = deepspeed.pipe.PipelineModule(
         layers=layers,
         num_stages=config['pipeline_stages'],
-        partition_method='parameters',
+        partition_method=config.get('partition_method', 'parameters'),
         **additional_pipeline_module_kwargs
     )
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
@@ -363,7 +363,7 @@ if __name__ == '__main__':
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss.item(), step)
 
-        if (config['eval_steps'] and step % config['eval_steps'] == 0) or (finished_epoch and config['eval_epochs'] and epoch % config['eval_epochs'] == 0):
+        if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'])
 
         if finished_epoch:
