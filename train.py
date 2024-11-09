@@ -196,7 +196,8 @@ if __name__ == '__main__':
     dataset_manager = dataset_util.DatasetManager(model)
     with open(config['dataset']) as f:
         dataset_config = toml.load(f)
-    train_data = dataset_util.Dataset(dataset_config, model, regenerate_cache=regenerate_cache)
+    caching_batch_size = config.get('caching_batch_size', 1)
+    train_data = dataset_util.Dataset(dataset_config, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
     dataset_manager.register(train_data)
 
     eval_data_map = {}
@@ -209,7 +210,7 @@ if __name__ == '__main__':
             config_path = eval_dataset['config']
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, regenerate_cache=regenerate_cache)
+        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
         dataset_manager.register(eval_data_map[name])
 
     dataset_manager.cache()

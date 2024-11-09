@@ -32,9 +32,8 @@ def crop_and_resize(pil_img, size_bucket):
 
 
 pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-def encode_pil_to_latents(pil_img, vae):
-    img = pil_to_tensor(pil_img)
-    img = img.unsqueeze(0)
+def encode_pil_to_latents(pil_imgs, vae):
+    img = torch.stack([pil_to_tensor(pil_img) for pil_img in pil_imgs])
     latents = vae.encode(img.to(vae.device, vae.dtype)).latent_dist.sample()
     if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
         latents = latents - vae.config.shift_factor
@@ -56,16 +55,19 @@ def decode_latents_to_pil(latents, vae):
 
 def process_image_fn(vae, size_bucket):
     def fn(example):
-        image_file = example['image_file']
-        try:
-            pil_img = Image.open(image_file)
-        except Exception:
-            logger.warning(f'Image file {image_file} could not be opened. Skipping.')
-            return None
-        pil_img = crop_and_resize(pil_img, size_bucket)
-        latents = encode_pil_to_latents(pil_img, vae)
+        pil_imgs = []
+        for image_file in example['image_file']:
+            try:
+                pil_img = Image.open(image_file)
+            except Exception:
+                logger.warning(f'Image file {image_file} could not be opened. Skipping.')
+                return None
+            pil_img = crop_and_resize(pil_img, size_bucket)
+            pil_imgs.append(pil_img)
 
-        return {'latents': latents.squeeze(0)}
+        latents = encode_pil_to_latents(pil_imgs, vae)
+        return {'latents': latents}
+
     return fn
 
 
@@ -161,11 +163,11 @@ class CustomFluxPipeline:
             return process_image_fn(module, size_bucket)
         elif module == self.text_encoder:
             def fn(example):
-                return {'clip_embed': self._get_clip_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu').squeeze(0)}
+                return {'clip_embed': self._get_clip_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu')}
             return fn
         elif module == self.text_encoder_2:
             def fn(example):
-                return {'t5_embed': self._get_t5_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu').squeeze(0)}
+                return {'t5_embed': self._get_t5_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu')}
             return fn
         else:
             raise RuntimeError(f'Module {module.__class__} does not have a map fn implemented')
