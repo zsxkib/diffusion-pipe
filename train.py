@@ -27,6 +27,7 @@ parser.add_argument('--config', help='Path to TOML configuration file.')
 parser.add_argument('--local_rank', type=int, default=-1,
                     help='local rank passed from distributed launcher')
 parser.add_argument('--resume_from_checkpoint', action='store_true', default=None, help='resume training from the most recent checkpoint')
+parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache. Useful if none of the files have changed but their contents have, e.g. modified captions.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -167,6 +168,10 @@ if __name__ == '__main__':
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
         else config.get('resume_from_checkpoint', False)
     )
+    regenerate_cache = (
+        args.regenerate_cache if args.regenerate_cache is not None
+        else config.get('regenerate_cache', False)
+    )
 
     deepspeed.init_distributed()
 
@@ -191,7 +196,7 @@ if __name__ == '__main__':
     dataset_manager = dataset_util.DatasetManager(model)
     with open(config['dataset']) as f:
         dataset_config = toml.load(f)
-    train_data = dataset_util.Dataset(dataset_config, model)
+    train_data = dataset_util.Dataset(dataset_config, model, regenerate_cache=regenerate_cache)
     dataset_manager.register(train_data)
 
     eval_data_map = {}
@@ -204,7 +209,7 @@ if __name__ == '__main__':
             config_path = eval_dataset['config']
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model)
+        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, regenerate_cache=regenerate_cache)
         dataset_manager.register(eval_data_map[name])
 
     dataset_manager.cache()

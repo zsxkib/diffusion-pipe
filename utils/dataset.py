@@ -64,7 +64,7 @@ def make_size_buckets(resolution, min_bucket_reso, max_bucket_reso, bucket_reso_
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
-    def __init__(self, filepaths, dataset_config, size_bucket, model):
+    def __init__(self, filepaths, dataset_config, size_bucket, model, regenerate_cache=False):
         logger.info(f'size_bucket: {size_bucket}, num_images: {len(filepaths)}')
         self.filepaths = filepaths
         self.config = dataset_config
@@ -72,6 +72,7 @@ class SizeBucketDataset:
         self.config.setdefault('caption_prefix', '')
         self.size_bucket = size_bucket
         self.model = model
+        self.regenerate_cache = regenerate_cache
         self.path = Path(self.config['path'])
         self.cache_dir = self.path / 'cache' / self.model.name / f'cache_{size_bucket[0]}x{size_bucket[1]}'
         self.datasets = []
@@ -92,7 +93,7 @@ class SizeBucketDataset:
         new_fingerprint_args.append(dataset._fingerprint)
         new_fingerprint = Hasher.hash(new_fingerprint_args)
         cache_file = self.cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
-        if cache_file.exists():
+        if (not is_main_process()) or (cache_file.exists() and not self.regenerate_cache):
             logger.info('Dataset fingerprint matched cache, loading from cache')
         else:
             logger.info('Dataset fingerprint changed, removing existing cache file and regenerating')
@@ -159,7 +160,7 @@ class ConcatenatedBatchedDataset:
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
 class Dataset:
-    def __init__(self, dataset_config, model):
+    def __init__(self, dataset_config, model, regenerate_cache=False):
         super().__init__()
         self.model = model
         self.post_init_called = False
@@ -175,7 +176,7 @@ class Dataset:
         for directory_config in dataset_config['directory']:
             size_bucket_to_filepaths = self._split_into_size_buckets(directory_config['path'], size_buckets)
             for size_bucket, filepaths in size_bucket_to_filepaths.items():
-                datasets_by_size_bucket[size_bucket].append(SizeBucketDataset(filepaths, directory_config, size_bucket, model))
+                datasets_by_size_bucket[size_bucket].append(SizeBucketDataset(filepaths, directory_config, size_bucket, model, regenerate_cache=regenerate_cache))
 
         self.buckets = []
         for datasets in datasets_by_size_bucket.values():
