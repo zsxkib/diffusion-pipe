@@ -2,6 +2,7 @@ from pathlib import Path
 import os.path
 import random
 from collections import defaultdict
+import math
 
 import torch
 from deepspeed.utils.logging import logger
@@ -36,6 +37,28 @@ def process_caption_fn(shuffle_tags=False, caption_prefix=''):
         example['caption'] = caption
         return example
     return fn
+
+
+# Modifed from: https://github.com/kohya-ss/sd-scripts/blob/main/library/model_util.py
+def make_size_buckets(resolution, min_bucket_reso, max_bucket_reso, bucket_reso_steps):
+    max_area = resolution**2
+
+    resos = set()
+
+    width = int(math.sqrt(max_area) // bucket_reso_steps) * bucket_reso_steps
+    resos.add((width, width))
+
+    width = min_bucket_reso
+    while width <= max_bucket_reso:
+        height = min(max_bucket_reso, int((max_area // width) // bucket_reso_steps) * bucket_reso_steps)
+        if height >= min_bucket_reso:
+            resos.add((width, height))
+            resos.add((height, width))
+        width += bucket_reso_steps
+
+    resos = list(resos)
+    resos.sort()
+    return resos
 
 
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
@@ -144,20 +167,9 @@ class Dataset:
         res = dataset_config['resolution']
 
         if dataset_config.get('enable_bucket', False):
-            min_bucket_reso = dataset_config.get('min_bucket_reso')
-            max_bucket_reso = dataset_config.get('max_bucket_reso')
-            bucket_reso_steps = dataset_config.get('bucket_reso_steps')
-            side1 = res
-            side2 = res
-            size_buckets = set()
-            while side1 <= max_bucket_reso and side2 >= min_bucket_reso:
-                size_buckets.add((side1, side2))
-                size_buckets.add((side2, side1))
-                side1 += bucket_reso_steps
-                side2 -= bucket_reso_steps
+            size_buckets = make_size_buckets(res, dataset_config.get('min_bucket_reso'), dataset_config.get('max_bucket_reso'), dataset_config.get('bucket_reso_steps'))
         else:
-            size_buckets = {(res, res)}
-        size_buckets = list(size_buckets)
+            size_buckets = [(res, res)]
 
         datasets_by_size_bucket = defaultdict(list)
         for directory_config in dataset_config['directory']:
