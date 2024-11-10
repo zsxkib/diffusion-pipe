@@ -191,7 +191,10 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    peft_config = model.configure_adapter(config['adapter'])
+    if 'adapter' in config:
+        peft_config = model.configure_adapter(config['adapter'])
+    else:
+        peft_config = None
 
     dataset_manager = dataset_util.DatasetManager(model)
     with open(config['dataset']) as f:

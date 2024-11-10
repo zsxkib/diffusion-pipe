@@ -79,8 +79,29 @@ class Saver:
             shutil.copy(self.args.deepspeed_config, save_dir)
             shutil.rmtree(tmp_dir)
 
-    def save_full_model(self, name):
-        raise NotImplementedError()
+    def save_full_model(self, name, max_shard_size='5GB'):
+        dp_id = self.model_engine.grid.get_data_parallel_rank()
+        stage_id = self.model_engine.grid.get_pipe_parallel_rank()
+        save_dir = self.save_root / name
+        tmp_dir = save_dir / 'tmp'
+        if dp_id == 0 and stage_id == 0:
+            os.makedirs(tmp_dir, exist_ok=False)
+        dist.barrier()
+        if dp_id == 0:
+            # With BF16_Optimizer, we get pickle errors unless we do p.detach(). I have no idea why.
+            partial_state_dict = {p.original_name: p.detach() for p in self.pipeline_model.parameters()}
+            if 'save_dtype' in self.config:
+                convert_state_dict_dtype(partial_state_dict, self.config['save_dtype'])
+            torch.save(partial_state_dict, tmp_dir / f'state_dict_{stage_id}.bin')
+        dist.barrier()
+        if dp_id == 0 and stage_id == 0:
+            state_dict = {}
+            for path in tmp_dir.glob('*.bin'):
+                state_dict.update(torch.load(path, map_location='cpu'))
+            self.model.save_model(save_dir, state_dict)
+            shutil.copy(self.args.config, save_dir)
+            shutil.copy(self.args.deepspeed_config, save_dir)
+            shutil.rmtree(tmp_dir)
 
     def save_model(self, name):
         if self.peft_config is not None:

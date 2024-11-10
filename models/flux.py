@@ -10,10 +10,92 @@ from torchvision import transforms
 from PIL import Image, ImageOps
 from deepspeed.utils.logging import logger
 from safetensors import safe_open
+from safetensors.torch import save_file
 
 from utils.common import is_main_process
 
 ADAPTER_TARGET_MODULES = ['FluxTransformerBlock', 'FluxSingleTransformerBlock']
+
+NUM_DOUBLE_BLOCKS = 19
+NUM_SINGLE_BLOCKS = 38
+
+BFL_TO_DIFFUSERS_MAP = {
+    "time_in.in_layer.weight": ["time_text_embed.timestep_embedder.linear_1.weight"],
+    "time_in.in_layer.bias": ["time_text_embed.timestep_embedder.linear_1.bias"],
+    "time_in.out_layer.weight": ["time_text_embed.timestep_embedder.linear_2.weight"],
+    "time_in.out_layer.bias": ["time_text_embed.timestep_embedder.linear_2.bias"],
+    "vector_in.in_layer.weight": ["time_text_embed.text_embedder.linear_1.weight"],
+    "vector_in.in_layer.bias": ["time_text_embed.text_embedder.linear_1.bias"],
+    "vector_in.out_layer.weight": ["time_text_embed.text_embedder.linear_2.weight"],
+    "vector_in.out_layer.bias": ["time_text_embed.text_embedder.linear_2.bias"],
+    "guidance_in.in_layer.weight": ["time_text_embed.guidance_embedder.linear_1.weight"],
+    "guidance_in.in_layer.bias": ["time_text_embed.guidance_embedder.linear_1.bias"],
+    "guidance_in.out_layer.weight": ["time_text_embed.guidance_embedder.linear_2.weight"],
+    "guidance_in.out_layer.bias": ["time_text_embed.guidance_embedder.linear_2.bias"],
+    "txt_in.weight": ["context_embedder.weight"],
+    "txt_in.bias": ["context_embedder.bias"],
+    "img_in.weight": ["x_embedder.weight"],
+    "img_in.bias": ["x_embedder.bias"],
+    "double_blocks.().img_mod.lin.weight": ["norm1.linear.weight"],
+    "double_blocks.().img_mod.lin.bias": ["norm1.linear.bias"],
+    "double_blocks.().txt_mod.lin.weight": ["norm1_context.linear.weight"],
+    "double_blocks.().txt_mod.lin.bias": ["norm1_context.linear.bias"],
+    "double_blocks.().img_attn.qkv.weight": ["attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight"],
+    "double_blocks.().img_attn.qkv.bias": ["attn.to_q.bias", "attn.to_k.bias", "attn.to_v.bias"],
+    "double_blocks.().txt_attn.qkv.weight": ["attn.add_q_proj.weight", "attn.add_k_proj.weight", "attn.add_v_proj.weight"],
+    "double_blocks.().txt_attn.qkv.bias": ["attn.add_q_proj.bias", "attn.add_k_proj.bias", "attn.add_v_proj.bias"],
+    "double_blocks.().img_attn.norm.query_norm.scale": ["attn.norm_q.weight"],
+    "double_blocks.().img_attn.norm.key_norm.scale": ["attn.norm_k.weight"],
+    "double_blocks.().txt_attn.norm.query_norm.scale": ["attn.norm_added_q.weight"],
+    "double_blocks.().txt_attn.norm.key_norm.scale": ["attn.norm_added_k.weight"],
+    "double_blocks.().img_mlp.0.weight": ["ff.net.0.proj.weight"],
+    "double_blocks.().img_mlp.0.bias": ["ff.net.0.proj.bias"],
+    "double_blocks.().img_mlp.2.weight": ["ff.net.2.weight"],
+    "double_blocks.().img_mlp.2.bias": ["ff.net.2.bias"],
+    "double_blocks.().txt_mlp.0.weight": ["ff_context.net.0.proj.weight"],
+    "double_blocks.().txt_mlp.0.bias": ["ff_context.net.0.proj.bias"],
+    "double_blocks.().txt_mlp.2.weight": ["ff_context.net.2.weight"],
+    "double_blocks.().txt_mlp.2.bias": ["ff_context.net.2.bias"],
+    "double_blocks.().img_attn.proj.weight": ["attn.to_out.0.weight"],
+    "double_blocks.().img_attn.proj.bias": ["attn.to_out.0.bias"],
+    "double_blocks.().txt_attn.proj.weight": ["attn.to_add_out.weight"],
+    "double_blocks.().txt_attn.proj.bias": ["attn.to_add_out.bias"],
+    "single_blocks.().modulation.lin.weight": ["norm.linear.weight"],
+    "single_blocks.().modulation.lin.bias": ["norm.linear.bias"],
+    "single_blocks.().linear1.weight": ["attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight", "proj_mlp.weight"],
+    "single_blocks.().linear1.bias": ["attn.to_q.bias", "attn.to_k.bias", "attn.to_v.bias", "proj_mlp.bias"],
+    "single_blocks.().linear2.weight": ["proj_out.weight"],
+    "single_blocks.().norm.query_norm.scale": ["attn.norm_q.weight"],
+    "single_blocks.().norm.key_norm.scale": ["attn.norm_k.weight"],
+    "single_blocks.().linear2.weight": ["proj_out.weight"],
+    "single_blocks.().linear2.bias": ["proj_out.bias"],
+    "final_layer.linear.weight": ["proj_out.weight"],
+    "final_layer.linear.bias": ["proj_out.bias"],
+    "final_layer.adaLN_modulation.1.weight": ["norm_out.linear.weight"],
+    "final_layer.adaLN_modulation.1.bias": ["norm_out.linear.bias"],
+}
+
+
+def make_diffusers_to_bfl_map(num_double_blocks: int = NUM_DOUBLE_BLOCKS, num_single_blocks: int = NUM_SINGLE_BLOCKS) -> dict[str, tuple[int, str]]:
+    # make reverse map from diffusers map
+    diffusers_to_bfl_map = {}  # key: diffusers_key, value: (index, bfl_key)
+    for b in range(num_double_blocks):
+        for key, weights in BFL_TO_DIFFUSERS_MAP.items():
+            if key.startswith("double_blocks."):
+                block_prefix = f"transformer_blocks.{b}."
+                for i, weight in enumerate(weights):
+                    diffusers_to_bfl_map[f"{block_prefix}{weight}"] = (i, key.replace("()", f"{b}"))
+    for b in range(num_single_blocks):
+        for key, weights in BFL_TO_DIFFUSERS_MAP.items():
+            if key.startswith("single_blocks."):
+                block_prefix = f"single_transformer_blocks.{b}."
+                for i, weight in enumerate(weights):
+                    diffusers_to_bfl_map[f"{block_prefix}{weight}"] = (i, key.replace("()", f"{b}"))
+    for key, weights in BFL_TO_DIFFUSERS_MAP.items():
+        if not (key.startswith("double_blocks.") or key.startswith("single_blocks.")):
+            for i, weight in enumerate(weights):
+                diffusers_to_bfl_map[weight] = (i, key)
+    return diffusers_to_bfl_map
 
 
 def crop_and_resize(pil_img, size_bucket):
@@ -114,6 +196,10 @@ class CustomFluxPipeline:
             kwargs['transformer'] = transformer
         self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=self.model_config['dtype'], **kwargs)
         self.transformer.train()
+        # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
+        # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
+        for name, p in self.transformer.named_parameters():
+            p.original_name = name
 
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
@@ -157,6 +243,41 @@ class CustomFluxPipeline:
             self.save_lora_weights(save_dir, transformer_lora_layers=peft_state_dict)
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
+
+    def save_model(self, save_dir, diffusers_sd):
+        diffusers_to_bfl_map = make_diffusers_to_bfl_map()
+
+        # iterate over three safetensors files to reduce memory usage
+        flux_sd = {}
+        for diffusers_key, tensor in diffusers_sd.items():
+            if diffusers_key in diffusers_to_bfl_map:
+                index, bfl_key = diffusers_to_bfl_map[diffusers_key]
+                if bfl_key not in flux_sd:
+                    flux_sd[bfl_key] = []
+                flux_sd[bfl_key].append((index, tensor))
+            else:
+                logger.error(f"Error: Key not found in diffusers_to_bfl_map: {diffusers_key}")
+                raise KeyError(f"Key not found in diffusers_to_bfl_map: {diffusers_key}")
+
+        # concat tensors if multiple tensors are mapped to a single key, sort by index
+        for key, values in flux_sd.items():
+            if len(values) == 1:
+                flux_sd[key] = values[0][1]
+            else:
+                flux_sd[key] = torch.cat([value[1] for value in sorted(values, key=lambda x: x[0])])
+
+        # special case for final_layer.adaLN_modulation.1.weight and final_layer.adaLN_modulation.1.bias
+        def swap_scale_shift(weight):
+            shift, scale = weight.chunk(2, dim=0)
+            new_weight = torch.cat([scale, shift], dim=0)
+            return new_weight
+
+        if "final_layer.adaLN_modulation.1.weight" in flux_sd:
+            flux_sd["final_layer.adaLN_modulation.1.weight"] = swap_scale_shift(flux_sd["final_layer.adaLN_modulation.1.weight"])
+        if "final_layer.adaLN_modulation.1.bias" in flux_sd:
+            flux_sd["final_layer.adaLN_modulation.1.bias"] = swap_scale_shift(flux_sd["final_layer.adaLN_modulation.1.bias"])
+
+        save_file(flux_sd, save_dir / 'model.safetensors', metadata={"format": "pt"})
 
     def get_dataset_map_fn(self, module, size_bucket):
         if module == self.vae:
