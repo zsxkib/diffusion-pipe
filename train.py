@@ -28,6 +28,7 @@ parser.add_argument('--local_rank', type=int, default=-1,
                     help='local rank passed from distributed launcher')
 parser.add_argument('--resume_from_checkpoint', action='store_true', default=None, help='resume training from the most recent checkpoint')
 parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache. Useful if none of the files have changed but their contents have, e.g. modified captions.')
+parser.add_argument('--cache_only', action='store_true', default=None, help='Cache model inputs then exit.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -381,6 +382,8 @@ if __name__ == '__main__':
             epoch = new_epoch
             if epoch is None:
                 break
+
+        saver.process_step(step)
         step += 1
 
     if is_main_process():

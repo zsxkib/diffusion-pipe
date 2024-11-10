@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 import shutil
 import time
+import sys
 
 import torch
 from deepspeed import comm as dist
@@ -17,13 +18,18 @@ def convert_state_dict_dtype(state_dict, dtype):
 
 last_checkpoint_time = None
 def need_to_checkpoint(config, epoch=None):
-    if epoch is not None and 'checkpoint_every_n_epochs' in config and epoch % config['checkpoint_every_n_epochs'] == 0:
-        return True
+    global last_checkpoint_time
+
+    if epoch is not None:
+        if 'checkpoint_every_n_epochs' in config and epoch % config['checkpoint_every_n_epochs'] == 0:
+            last_checkpoint_time = time.time()
+            return True
+        else:
+            return False
 
     if 'checkpoint_every_n_minutes' not in config:
         return False
 
-    global last_checkpoint_time
     checkpoint = False
     # rank 0 tracks if we need to checkpoint, broadcasts to everyone else
     if is_main_process():
@@ -134,3 +140,32 @@ class Saver:
             if is_main_process():
                 print(f'Started new epoch: {epoch}')
         return epoch
+
+    def process_step(self, step):
+        # Look at some simple "signal files" the user can write to save and optionally quit manually
+        should_manually_save = False
+        should_manually_quit = False
+        save_signal_file = self.save_root / 'save'
+        save_quit_signal_file = self.save_root / 'save_quit'
+        if save_signal_file.exists() and save_signal_file.is_file():
+            should_manually_save = True
+            dist.barrier()
+            if is_main_process():
+                os.remove(save_signal_file)
+        elif save_quit_signal_file.exists() and save_quit_signal_file.is_file():
+            should_manually_save = True
+            should_manually_quit = True
+            dist.barrier()
+            if is_main_process():
+                os.remove(save_quit_signal_file)
+
+        # TODO: support save_every_n_steps in addition to save_every_n_epochs. Maybe only one should be set?
+        # if step % self.config['save_every_n_steps'] == 0 or should_manually_save:
+        #     self.save_model(f'step{step}')
+
+        if need_to_checkpoint(self.config) or should_manually_save:
+            self.save_checkpoint(step)
+
+        if should_manually_quit:
+            print('Manually quitting')
+            sys.exit()
