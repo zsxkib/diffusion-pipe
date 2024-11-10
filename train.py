@@ -217,6 +217,8 @@ if __name__ == '__main__':
         dataset_manager.register(eval_data_map[name])
 
     dataset_manager.cache()
+    if args.cache_only:
+        quit()
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
