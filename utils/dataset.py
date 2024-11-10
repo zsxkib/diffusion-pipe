@@ -65,7 +65,6 @@ def make_size_buckets(resolution, min_bucket_reso, max_bucket_reso, bucket_reso_
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
     def __init__(self, filepaths, dataset_config, size_bucket, model, regenerate_cache=False, caching_batch_size=1):
-        logger.info(f'size_bucket: {size_bucket}, num_images: {len(filepaths)}')
         self.filepaths = filepaths
         self.config = dataset_config
         self.config.setdefault('shuffle_tags', False)
@@ -77,6 +76,8 @@ class SizeBucketDataset:
         self.path = Path(self.config['path'])
         self.cache_dir = self.path / 'cache' / self.model.name / f'cache_{size_bucket[0]}x{size_bucket[1]}'
         self.datasets = []
+        self.num_repeats = self.config.get('num_repeats', 1)
+        logger.info(f'size_bucket: {size_bucket}, num_images: {len(filepaths)}, num_repeats: {self.num_repeats}')
 
         os.makedirs(self.cache_dir, exist_ok=True)
         image_and_caption_files = self.filepaths
@@ -116,6 +117,7 @@ class SizeBucketDataset:
         self.datasets.append(self._map_and_cache(self.image_file_and_caption_dataset, self.model.get_dataset_map_fn(module, self.size_bucket), cache_file_prefix=f'module_{i}_', new_fingerprint_args=[i]))
 
     def __getitem__(self, idx):
+        idx = idx % len(self.image_file_and_caption_dataset)
         if DEBUG:
             print(Path(self.image_file_and_caption_dataset[idx]['image_file']).stem)
         ret = {}
@@ -124,7 +126,7 @@ class SizeBucketDataset:
         return ret
 
     def __len__(self):
-        return len(self.image_file_and_caption_dataset)
+        return len(self.image_file_and_caption_dataset) * self.num_repeats
 
 
 # Logical concatenation of multiple SizeBucketDataset, for the same size bucket. It returns items
