@@ -5,6 +5,8 @@ import shutil
 import glob
 import time
 import random
+import json
+import inspect
 
 import toml
 import deepspeed
@@ -163,6 +165,9 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
 if __name__ == '__main__':
     with open(args.config) as f:
         config = toml.load(f)
+    with open(args.deepspeed_config) as f:
+        ds_config = json.load(f)
+
     set_config_defaults(config)
 
     resume_from_checkpoint = (
@@ -250,45 +255,82 @@ if __name__ == '__main__':
 
     def get_optimizer(model_parameters):
         optim_config = config['optimizer']
-        lr = optim_config['lr']
         optim_type = optim_config['type'].lower()
+
+        kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
+
         if optim_type == 'adamw':
             # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
             # when Deepspeed tries to build the fused Adam extension.
-            # return deepspeed.ops.adam.FusedAdam(
-            #     model_parameters,
-            #     lr=lr,
-            #     betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
-            #     weight_decay=optim_config.get('weight_decay', 0.01),
-            #     eps=optim_config.get('eps', 1e-8)
-            # )
-            return torch.optim.AdamW(
-                model_parameters,
-                lr=lr,
-                betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
-                weight_decay=optim_config.get('weight_decay', 0.01),
-                eps=optim_config.get('eps', 1e-8)
-            )
+            # klass = deepspeed.ops.adam.FusedAdam
+            klass = torch.optim.AdamW
         elif optim_type == 'adamw8bit':
-            return bitsandbytes.optim.AdamW8bit(
-                model_parameters,
-                lr=lr,
-                betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
-                weight_decay=optim_config.get('weight_decay', 0.01),
-                eps=optim_config.get('eps', 1e-8)
-            )
-        elif optim_type == 'adamw_kahan':
+            import bitsandbytes
+            klass = bitsandbytes.optim.AdamW8bit
+        elif optim_type == 'adamw_optimi':
             import optimi
-            return optimi.AdamW(
-                model_parameters,
-                lr=lr,
-                betas=(optim_config.get('beta1', 0.9), optim_config.get('beta2', 0.99)),
-                weight_decay=optim_config.get('weight_decay', 0.01),
-                kahan_sum=optim_config.get('kahan_sum', True),
-                eps=optim_config.get('eps', 1e-8)
-            )
+            klass = optimi.AdamW
+        elif optim_type == 'stableadamw':
+            import optimi
+            klass = optimi.StableAdamW
+        elif optim_type == 'sgd':
+            klass = torch.optim.SGD
+        elif optim_type == 'adamw8bitkahan':
+            from optimizers import adamw_8bit
+            klass = adamw_8bit.AdamW8bitKahan
         else:
             raise NotImplementedError(optim_type)
+
+        if optim_config.get('gradient_release', False):
+            # Prevent deepspeed from logging every single param group lr
+            def _report_progress(self, step):
+                lr = self.get_lr()
+                mom = self.get_mom()
+                deepspeed.utils.logging.log_dist(f"step={step}, skipped={self.skipped_steps}, lr={lr[0]}, mom={mom[0]}", ranks=[0])
+            deepspeed.runtime.engine.DeepSpeedEngine._report_progress = _report_progress
+
+            # When pipelining multiple forward and backward passes, normally updating the parameter in-place causes an error when calling
+            # backward() on future micro-batches. But we can modify .data directly so the autograd engine doesn't detect in-place modifications.
+            # TODO: this is unbelievably hacky and not mathematically sound, I'm just seeing if it works at all.
+            def add_(self, *args, **kwargs):
+                self.data.add_(*args, **kwargs)
+            for p in model_parameters:
+                p.add_ = add_.__get__(p)
+
+            if 'foreach' in inspect.signature(klass).parameters:
+                kwargs['foreach'] = False
+
+            # We're doing an optimizer step for each micro-batch. Scale momentum and EMA betas so that the contribution
+            # decays at the same rate it would if we were doing one step per batch like normal.
+            # Reference: https://alexeytochin.github.io/posts/batch_size_vs_momentum/batch_size_vs_momentum.html
+            gas = ds_config['gradient_accumulation_steps']
+            if 'betas' in kwargs:
+                for i in range(len(kwargs['betas'])):
+                    kwargs['betas'][i] = kwargs['betas'][i] ** (1/gas)
+            if 'momentum' in kwargs:
+                kwargs['momentum'] = kwargs['momentum'] ** (1/gas)
+
+            optimizer_dict = {p: klass([p], **kwargs) for p in model_parameters}
+
+            def optimizer_hook(p):
+                optimizer_dict[p].step()
+                optimizer_dict[p].zero_grad()
+
+            for p in model_parameters:
+                p.register_post_accumulate_grad_hook(optimizer_hook)
+
+            from optimizers import gradient_release
+            return gradient_release.GradientReleaseOptimizerWrapper(list(optimizer_dict.values()))
+        else:
+            return klass(model_parameters, **kwargs)
+
+    # Deepspeed executes all the code to reduce grads across data parallel ranks even if the DP world size is 1.
+    # As part of this, any grads that are None are set to zeros. We're doing gradient release to save memory,
+    # so we have to avoid this.
+    def _exec_reduce_grads(self):
+        assert self.mpu.get_data_parallel_world_size() == 1, 'Data parallel world size must be 1. Make sure pipeline_stages = num_gpus.'
+        return
+    deepspeed.runtime.pipe.engine.PipelineEngine._INSTRUCTION_MAP[deepspeed.runtime.pipe.schedule.ReduceGrads] = _exec_reduce_grads
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
@@ -363,22 +405,31 @@ if __name__ == '__main__':
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'])
 
+    # TODO: this is state we need to save and resume when resuming from checkpoint.
+    epoch_loss = 0
+    num_steps = 0
     while True:
         #empty_cuda_cache()
         model_engine.reset_activation_shape()
-        loss = model_engine.train_batch()
+        loss = model_engine.train_batch().item()
+        epoch_loss += loss
+        num_steps += 1
         train_dataloader.sync_epoch()
 
         new_epoch = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False
 
         if is_main_process() and step % config['logging_steps'] == 0:
-            tb_writer.add_scalar(f'train/loss', loss.item(), step)
+            tb_writer.add_scalar(f'train/loss', loss, step)
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'])
 
         if finished_epoch:
+            if is_main_process():
+                tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
+            epoch_loss = 0
+            num_steps = 0
             epoch = new_epoch
             if epoch is None:
                 break
