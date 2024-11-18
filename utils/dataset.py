@@ -45,9 +45,10 @@ def round_to_multiple(x, multiple):
     return int((x // multiple) * multiple)
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=[], regenerate_cache=False, caching_batch_size=1):
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
     # Do the fingerprinting ourselves, because otherwise map() does it by serializing the map function.
     # That goes poorly when the function is capturing huge models (slow, OOMs, etc).
+    new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)
     new_fingerprint = Hasher.hash(new_fingerprint_args)
     cache_file = cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
@@ -94,7 +95,7 @@ class SizeBucketDataset:
                 self.image_file_and_caption_dataset,
                 self.model.get_latents_map_fn(vae, self.size_bucket),
                 self.cache_dir,
-                cache_file_prefix=f'latents_',
+                cache_file_prefix='latents_',
                 regenerate_cache=self.regenerate_cache,
                 caching_batch_size=self.caching_batch_size
             )
@@ -164,7 +165,7 @@ class ARBucketDataset:
         self.model = model
         self.size_buckets = []
         self.path = Path(directory_config['path'])
-        self.cache_dir = self.path / 'cache' / self.model.name / f'ar_bucket_{self.ar}'
+        self.cache_dir = self.path / 'cache' / self.model.name / f'ar_bucket_{self.ar:.3f}'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.regenerate_cache = regenerate_cache
         self.caching_batch_size = caching_batch_size
@@ -296,6 +297,7 @@ class DirectoryDataset:
 class Dataset:
     def __init__(self, dataset_config, model, regenerate_cache=False, caching_batch_size=1):
         super().__init__()
+        self.dataset_config = dataset_config
         self.model = model
         self.post_init_called = False
         self.eval_quantile = None
@@ -334,6 +336,11 @@ class Dataset:
             print(f'Dataset iteration_order: {self.iteration_order}')
 
         self.post_init_called = True
+
+        if subsample_ratio := self.dataset_config.get('subsample_ratio', None):
+            logger.info(f'Subsampling dataset with ratio {subsample_ratio}')
+            new_len = int(len(self) * subsample_ratio)
+            self.iteration_order = self.iteration_order[:new_len]
 
     def set_eval_quantile(self, quantile):
         self.eval_quantile = quantile
@@ -388,6 +395,7 @@ class DatasetManager:
         vae = self.model.get_vae()
         if is_main_process():
             vae.to('cuda')
+        logger.info('Caching latents')
         for ds in self.datasets:
             ds.cache_latents(vae)
         vae.to('cpu')
@@ -396,6 +404,7 @@ class DatasetManager:
         for i, text_encoder in enumerate(self.model.get_text_encoders()):
             if is_main_process():
                 text_encoder.to('cuda')
+            logger.info(f'Caching text embeddings {i}')
             for ds in self.datasets:
                 ds.cache_text_embeddings(text_encoder, i)
             text_encoder.to('cpu')
