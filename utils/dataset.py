@@ -87,7 +87,8 @@ class SizeBucketDataset:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.datasets = []
         self.num_repeats = self.directory_config.get('num_repeats', 1)
-        logger.info(f'size_bucket: {size_bucket}, num_images: {len(self.image_file_and_caption_dataset)}, num_repeats: {self.num_repeats}')
+        if is_main_process():
+            logger.info(f'size_bucket: {size_bucket}, num_images: {len(self.image_file_and_caption_dataset)}, num_repeats: {self.num_repeats}')
 
     def cache_latents(self, vae):
         self.datasets.append(
@@ -245,7 +246,8 @@ class DirectoryDataset:
             image_file = file
             caption_file = image_file.with_suffix('.txt')
             if not os.path.exists(caption_file):
-                logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
+                if is_main_process():
+                    logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
                 continue
             ar_bucket = self._find_closest_ar_bucket(image_file, log_ars)
             if ar_bucket is not None:
@@ -269,7 +271,8 @@ class DirectoryDataset:
         try:
             pil_img = Image.open(image_file)
         except Exception:
-            logger.warning(f'Image file {image_file} could not be opened. Skipping.')
+            if is_main_process():
+                logger.warning(f'Image file {image_file} could not be opened. Skipping.')
             return None
         width, height = pil_img.size
         log_ar = np.log(width / height)
@@ -338,7 +341,8 @@ class Dataset:
         self.post_init_called = True
 
         if subsample_ratio := self.dataset_config.get('subsample_ratio', None):
-            logger.info(f'Subsampling dataset with ratio {subsample_ratio}')
+            if is_main_process():
+                logger.info(f'Subsampling dataset with ratio {subsample_ratio}')
             new_len = int(len(self) * subsample_ratio)
             self.iteration_order = self.iteration_order[:new_len]
 
@@ -395,7 +399,7 @@ class DatasetManager:
         vae = self.model.get_vae()
         if is_main_process():
             vae.to('cuda')
-        logger.info('Caching latents')
+            logger.info('Caching latents')
         for ds in self.datasets:
             ds.cache_latents(vae)
         vae.to('cpu')
@@ -404,7 +408,7 @@ class DatasetManager:
         for i, text_encoder in enumerate(self.model.get_text_encoders()):
             if is_main_process():
                 text_encoder.to('cuda')
-            logger.info(f'Caching text embeddings {i}')
+                logger.info(f'Caching text embeddings {i}')
             for ds in self.datasets:
                 ds.cache_text_embeddings(text_encoder, i)
             text_encoder.to('cpu')
