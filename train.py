@@ -295,6 +295,14 @@ if __name__ == '__main__':
                 deepspeed.utils.logging.log_dist(f"step={step}, skipped={self.skipped_steps}, lr={lr[0]}, mom={mom[0]}", ranks=[0])
             deepspeed.runtime.engine.DeepSpeedEngine._report_progress = _report_progress
 
+            # Deepspeed executes all the code to reduce grads across data parallel ranks even if the DP world size is 1.
+            # As part of this, any grads that are None are set to zeros. We're doing gradient release to save memory,
+            # so we have to avoid this.
+            def _exec_reduce_grads(self):
+                assert self.mpu.get_data_parallel_world_size() == 1, 'Data parallel world size must be 1. Make sure pipeline_stages = num_gpus.'
+                return
+            deepspeed.runtime.pipe.engine.PipelineEngine._INSTRUCTION_MAP[deepspeed.runtime.pipe.schedule.ReduceGrads] = _exec_reduce_grads
+
             # When pipelining multiple forward and backward passes, normally updating the parameter in-place causes an error when calling
             # backward() on future micro-batches. But we can modify .data directly so the autograd engine doesn't detect in-place modifications.
             # TODO: this is unbelievably hacky and not mathematically sound, I'm just seeing if it works at all.
@@ -329,14 +337,6 @@ if __name__ == '__main__':
             return gradient_release.GradientReleaseOptimizerWrapper(list(optimizer_dict.values()))
         else:
             return klass(model_parameters, *args, **kwargs)
-
-    # Deepspeed executes all the code to reduce grads across data parallel ranks even if the DP world size is 1.
-    # As part of this, any grads that are None are set to zeros. We're doing gradient release to save memory,
-    # so we have to avoid this.
-    def _exec_reduce_grads(self):
-        assert self.mpu.get_data_parallel_world_size() == 1, 'Data parallel world size must be 1. Make sure pipeline_stages = num_gpus.'
-        return
-    deepspeed.runtime.pipe.engine.PipelineEngine._INSTRUCTION_MAP[deepspeed.runtime.pipe.schedule.ReduceGrads] = _exec_reduce_grads
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
