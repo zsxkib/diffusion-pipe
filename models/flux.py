@@ -204,8 +204,11 @@ class CustomFluxPipeline:
     def __getattr__(self, name):
         return getattr(self.diffusers_pipeline, name)
 
-    def get_modules(self):
-        return self.vae, self.text_encoder, self.text_encoder_2
+    def get_vae(self):
+        return self.vae
+
+    def get_text_encoders(self):
+        return self.text_encoder, self.text_encoder_2
 
     def configure_adapter(self, adapter_config):
         target_linear_modules = []
@@ -279,19 +282,20 @@ class CustomFluxPipeline:
 
         save_file(flux_sd, save_dir / 'model.safetensors', metadata={"format": "pt"})
 
-    def get_dataset_map_fn(self, module, size_bucket):
-        if module == self.vae:
-            return process_image_fn(module, size_bucket)
-        elif module == self.text_encoder:
+    def get_latents_map_fn(self, vae, size_bucket):
+        return process_image_fn(vae, size_bucket)
+
+    def get_text_embeddings_map_fn(self, text_encoder):
+        if text_encoder == self.text_encoder:
             def fn(example):
-                return {'clip_embed': self._get_clip_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu')}
+                return {'clip_embed': self._get_clip_prompt_embeds(prompt=example['caption'], device=text_encoder.device).to('cpu')}
             return fn
-        elif module == self.text_encoder_2:
+        elif text_encoder == self.text_encoder_2:
             def fn(example):
-                return {'t5_embed': self._get_t5_prompt_embeds(prompt=example['caption'], device=module.device).to('cpu')}
+                return {'t5_embed': self._get_t5_prompt_embeds(prompt=example['caption'], device=text_encoder.device).to('cpu')}
             return fn
         else:
-            raise RuntimeError(f'Module {module.__class__} does not have a map fn implemented')
+            raise RuntimeError(f'Text encoder {text_encoder.__class__} does not have a map fn implemented')
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents']

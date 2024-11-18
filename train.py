@@ -257,6 +257,7 @@ if __name__ == '__main__':
         optim_config = config['optimizer']
         optim_type = optim_config['type'].lower()
 
+        args = []
         kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
 
         if optim_type == 'adamw':
@@ -278,6 +279,11 @@ if __name__ == '__main__':
         elif optim_type == 'adamw8bitkahan':
             from optimizers import adamw_8bit
             klass = adamw_8bit.AdamW8bitKahan
+        elif optim_type == 'offload':
+            from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
+            klass = CPUOffloadOptimizer
+            args.append(torch.optim.AdamW)
+            kwargs['fused'] = True
         else:
             raise NotImplementedError(optim_type)
 
@@ -322,7 +328,7 @@ if __name__ == '__main__':
             from optimizers import gradient_release
             return gradient_release.GradientReleaseOptimizerWrapper(list(optimizer_dict.values()))
         else:
-            return klass(model_parameters, **kwargs)
+            return klass(model_parameters, *args, **kwargs)
 
     # Deepspeed executes all the code to reduce grads across data parallel ranks even if the DP world size is 1.
     # As part of this, any grads that are None are set to zeros. We're doing gradient release to save memory,
