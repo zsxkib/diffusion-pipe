@@ -12,3 +12,5 @@ tensorboard
 tqdm
 safetensors
 bitsandbytes
+imageio
+av

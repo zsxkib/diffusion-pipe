@@ -20,7 +20,7 @@ from utils import dataset as dataset_util
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
 from utils.isolate_rng import isolate_rng
-from models import flux
+from models import flux, ltx_video
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -184,7 +184,9 @@ if __name__ == '__main__':
     model_type = config['model']['type']
 
     if model_type == 'flux':
-        model = flux.CustomFluxPipeline(config)
+        model = flux.FluxPipeline(config)
+    elif model_type == 'ltx-video':
+        model = ltx_video.LTXVideoPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -196,11 +198,6 @@ if __name__ == '__main__':
     #     pil_image = dataset.decode_latents_to_pil(latents, vae)
     #     pil_image.save('test.jpg')
     # quit()
-
-    if 'adapter' in config:
-        peft_config = model.configure_adapter(config['adapter'])
-    else:
-        peft_config = None
 
     dataset_manager = dataset_util.DatasetManager(model)
     with open(config['dataset']) as f:
@@ -225,6 +222,11 @@ if __name__ == '__main__':
     dataset_manager.cache()
     if args.cache_only:
         quit()
+
+    if 'adapter' in config:
+        peft_config = model.configure_adapter(config['adapter'])
+    else:
+        peft_config = None
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
@@ -362,7 +364,7 @@ if __name__ == '__main__':
         eval_data.post_init(
             model_engine.grid.get_data_parallel_rank(),
             model_engine.grid.get_data_parallel_world_size(),
-            model_engine.train_micro_batch_size_per_gpu(),
+            config.get('eval_batch_size', model_engine.train_micro_batch_size_per_gpu()),
             config['eval_gradient_accumulation_steps'],
         )
 

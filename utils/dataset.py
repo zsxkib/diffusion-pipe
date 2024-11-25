@@ -10,6 +10,7 @@ from deepspeed import comm as dist
 import datasets
 from datasets.fingerprint import Hasher
 from PIL import Image
+import imageio
 import numpy as np
 
 from utils.common import zero_first, empty_cuda_cache, is_main_process
@@ -269,11 +270,14 @@ class DirectoryDataset:
 
     def _find_closest_ar_bucket(self, image_file, log_ars):
         try:
+            # TODO: use imageio for video support. It is A LOT slower in this piece of code than PIL for images.
+            #img = imageio.v3.imread(image_file)
             pil_img = Image.open(image_file)
         except Exception:
             if is_main_process():
                 logger.warning(f'Image file {image_file} could not be opened. Skipping.')
             return None
+        #height, width = img.shape[-3:-1]
         width, height = pil_img.size
         log_ar = np.log(width / height)
         # Best AR bucket is the one with the smallest AR difference in log space.
