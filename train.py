@@ -7,6 +7,7 @@ import time
 import random
 import json
 import inspect
+from pathlib import Path
 
 import toml
 import deepspeed
@@ -15,6 +16,7 @@ import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import safetensors.torch
 
 from utils import dataset as dataset_util
 from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
@@ -223,8 +225,10 @@ if __name__ == '__main__':
     if args.cache_only:
         quit()
 
-    if 'adapter' in config:
-        peft_config = model.configure_adapter(config['adapter'])
+    if adapter_config := config.get('adapter', None):
+        peft_config = model.configure_adapter(adapter_config)
+        if init_from_existing := adapter_config.get('init_from_existing', None):
+            model.load_adapter_weights(init_from_existing)
     else:
         peft_config = None
 

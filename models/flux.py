@@ -135,6 +135,7 @@ def decode_latents_to_pil(latents, vae):
 
 
 def process_image_fn(vae, size_bucket):
+    width_height = size_bucket[:2]
     def fn(example):
         pil_imgs = []
         for image_file in example['image_file']:
@@ -143,7 +144,7 @@ def process_image_fn(vae, size_bucket):
             except Exception:
                 logger.warning(f'Image file {image_file} could not be opened. Skipping.')
                 return None
-            pil_img = crop_and_resize(pil_img, size_bucket)
+            pil_img = crop_and_resize(pil_img, width_height)
             pil_imgs.append(pil_img)
 
         latents = encode_pil_to_latents(pil_imgs, vae)

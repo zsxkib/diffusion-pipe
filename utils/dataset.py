@@ -13,7 +13,7 @@ from PIL import Image
 import imageio
 import numpy as np
 
-from utils.common import zero_first, empty_cuda_cache, is_main_process
+from utils.common import zero_first, empty_cuda_cache, is_main_process, VIDEO_EXTENSIONS
 
 
 DEBUG = False
@@ -84,7 +84,7 @@ class SizeBucketDataset:
         self.regenerate_cache = regenerate_cache
         self.caching_batch_size = caching_batch_size
         self.path = Path(self.directory_config['path'])
-        self.cache_dir = self.path / 'cache' / self.model.name / f'cache_{size_bucket[0]}x{size_bucket[1]}'
+        self.cache_dir = self.path / 'cache' / self.model.name / f'cache_{size_bucket[0]}x{size_bucket[1]}x{size_bucket[2]}'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.datasets = []
         self.num_repeats = self.directory_config.get('num_repeats', 1)
@@ -159,15 +159,15 @@ class ConcatenatedBatchedDataset:
 
 
 class ARBucketDataset:
-    def __init__(self, ar, resolutions, filepaths, directory_config, model, regenerate_cache=False, caching_batch_size=1):
-        self.ar = ar
+    def __init__(self, ar_frames, resolutions, filepaths, directory_config, model, regenerate_cache=False, caching_batch_size=1):
+        self.ar_frames = ar_frames
         self.resolutions = resolutions
         self.filepaths = filepaths
         self.directory_config = directory_config
         self.model = model
         self.size_buckets = []
         self.path = Path(directory_config['path'])
-        self.cache_dir = self.path / 'cache' / self.model.name / f'ar_bucket_{self.ar:.3f}'
+        self.cache_dir = self.path / 'cache' / self.model.name / f'ar_frames_{self.ar_frames[0]:.3f}_{self.ar_frames[1]}'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.regenerate_cache = regenerate_cache
         self.caching_batch_size = caching_batch_size
@@ -187,11 +187,11 @@ class ARBucketDataset:
 
         for res in resolutions:
             area = res**2
-            w = math.sqrt(area * self.ar)
+            w = math.sqrt(area * self.ar_frames[0])
             h = area / w
             w = round_to_multiple(w, IMAGE_SIZE_ROUND_TO_MULTIPLE)
             h = round_to_multiple(h, IMAGE_SIZE_ROUND_TO_MULTIPLE)
-            size_bucket = (w, h)
+            size_bucket = (w, h, self.ar_frames[1])
             self.size_buckets.append(
                 SizeBucketDataset(self.image_file_and_caption_dataset, directory_config, size_bucket, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
             )
@@ -233,8 +233,10 @@ class DirectoryDataset:
             num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
             ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
         log_ars = np.log(ars)
+        frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
+        frame_buckets = np.array(frame_buckets)
 
-        ar_bucket_to_filepaths = [[] for _ in range(len(ars))]
+        ar_bucket_to_filepaths = defaultdict(list)
         path = Path(self.directory_config['path'])
         if not path.exists() or not path.is_dir():
             raise RuntimeError(f'Invalid path: {path}')
@@ -250,16 +252,22 @@ class DirectoryDataset:
                 if is_main_process():
                     logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
                 continue
-            ar_bucket = self._find_closest_ar_bucket(image_file, log_ars)
+            ar_bucket = self._find_closest_ar_bucket(image_file, ars, log_ars, frame_buckets)
             if ar_bucket is not None:
                 ar_bucket_to_filepaths[ar_bucket].append((str(image_file), str(caption_file)))
 
         self.ar_buckets = []
-        for i, filepaths in enumerate(ar_bucket_to_filepaths):
-            if len(filepaths) == 0:
-                continue
+        for ar_bucket, filepaths in ar_bucket_to_filepaths.items():
             self.ar_buckets.append(
-                ARBucketDataset(ars[i], self.resolutions, filepaths, directory_config, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+                ARBucketDataset(
+                    ar_bucket,
+                    self.resolutions,
+                    filepaths,
+                    directory_config,
+                    model,
+                    regenerate_cache=regenerate_cache,
+                    caching_batch_size=caching_batch_size,
+                )
             )
 
     def _set_defaults(self, directory_config, dataset_config):
@@ -268,20 +276,24 @@ class DirectoryDataset:
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
 
-    def _find_closest_ar_bucket(self, image_file, log_ars):
+    def _find_closest_ar_bucket(self, image_file, ars, log_ars, frame_buckets):
         try:
-            # TODO: use imageio for video support. It is A LOT slower in this piece of code than PIL for images.
-            #img = imageio.v3.imread(image_file)
-            pil_img = Image.open(image_file)
+            if image_file.suffix in VIDEO_EXTENSIONS:
+                img = imageio.v3.imread(image_file)
+                frames, height, width = img.shape[-4:-1]
+            else:
+                pil_img = Image.open(image_file)
+                width, height = pil_img.size
+                frames = 1
         except Exception:
             if is_main_process():
                 logger.warning(f'Image file {image_file} could not be opened. Skipping.')
             return None
-        #height, width = img.shape[-3:-1]
-        width, height = pil_img.size
         log_ar = np.log(width / height)
         # Best AR bucket is the one with the smallest AR difference in log space.
-        return np.argmin(np.abs(log_ar - log_ars))
+        i = np.argmin(np.abs(log_ar - log_ars))
+        j = np.argmin(np.abs(frames - frame_buckets))
+        return (ars[i], frame_buckets[j])
 
     def get_size_bucket_datasets(self):
         result = []

@@ -12,8 +12,10 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision
 from diffusers.image_processor import VaeImageProcessor
+import numpy as np
 
 from models.base import BasePipeline
+from utils import common
 from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
 from ltx_video.models.autoencoders.causal_video_autoencoder import CausalVideoAutoencoder
 from ltx_video.models.transformers.transformer3d import Transformer3DModel
@@ -22,7 +24,6 @@ from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline as OriginalL
 from ltx_video.models.autoencoders.vae_encode import vae_encode
 
 
-VIDEO_EXTENSIONS = set(x.extension for x in imageio.config.video_extensions)
 FRAMERATE = 25
 
 
@@ -53,12 +54,23 @@ def load_scheduler(scheduler_dir):
     return RectifiedFlowScheduler.from_config(scheduler_config)
 
 
+def pad_or_truncate_frames(video, target_frames):
+    frames = video.shape[0]
+    if frames >= target_frames:
+        return video[:target_frames]
+    # pad
+    num_padding_frames = target_frames - frames
+    # amount of padding (before, after) for each axis
+    pad_width = ((0, num_padding_frames), (0, 0), (0, 0), (0, 0))
+    return np.pad(video, pad_width=pad_width, mode='constant', constant_values=0.)
+
+
 def process_video_fn(vae, size_bucket):
     image_processor = VaeImageProcessor(vae_scale_factor=32)
     def fn(example):
         videos = []
         for path in example['image_file']:
-            is_video = (Path(path).suffix in VIDEO_EXTENSIONS)
+            is_video = (Path(path).suffix in common.VIDEO_EXTENSIONS)
             if is_video:
                 video = imageio.v3.imread(path, fps=FRAMERATE)
             else:
@@ -67,9 +79,12 @@ def process_video_fn(vae, size_bucket):
                 # make image have 1 frame
                 video = video[None, ...]
 
-            width, height = size_bucket
+            width, height, frames = size_bucket
             height_padded = ((height - 1) // 32 + 1) * 32
             width_padded = ((width - 1) // 32 + 1) * 32
+            frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
+
+            video = pad_or_truncate_frames(video, frames_padded)
 
             images = [torchvision.transforms.functional.to_pil_image(frame) for frame in video]
             video = image_processor.preprocess(images, height=height_padded, width=width_padded, resize_mode='crop')

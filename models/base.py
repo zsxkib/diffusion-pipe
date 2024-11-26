@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import peft
 from torch import nn
+import safetensors.torch
 
 from utils.common import is_main_process
 
@@ -44,6 +47,20 @@ class BasePipeline:
 
     def save_adapter(self, save_dir, peft_state_dict):
         raise NotImplementedError()
+
+    def load_adapter_weights(self, adapter_path):
+        if is_main_process():
+            print(f'Loading adapter weights from path {adapter_path}')
+        adapter_state_dict = safetensors.torch.load_file(Path(adapter_path) / 'adapter_model.safetensors')
+        modified_state_dict = {}
+        model_parameters = set(name for name, p in self.transformer.named_parameters())
+        for k, v in adapter_state_dict.items():
+            k = k.replace('transformer.', '')
+            k = k.replace('weight', 'default.weight')
+            if k not in model_parameters:
+                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
+            modified_state_dict[k] = v
+        self.transformer.load_state_dict(modified_state_dict, strict=False)
 
     def save_model(self, save_dir, diffusers_sd):
         raise NotImplementedError()
