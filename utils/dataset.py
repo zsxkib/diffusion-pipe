@@ -3,6 +3,7 @@ import os.path
 import random
 from collections import defaultdict
 import math
+import os
 
 import torch
 from deepspeed.utils.logging import logger
@@ -18,6 +19,7 @@ from utils.common import zero_first, empty_cuda_cache, is_main_process, VIDEO_EX
 
 DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
+NUM_PROC = min(64, os.cpu_count())
 
 
 def shuffle_with_seed(l, seed=None):
@@ -46,29 +48,26 @@ def round_to_multiple(x, multiple):
     return int((x // multiple) * multiple)
 
 
-def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
+def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, with_indices=False):
     # Do the fingerprinting ourselves, because otherwise map() does it by serializing the map function.
     # That goes poorly when the function is capturing huge models (slow, OOMs, etc).
     new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)
     new_fingerprint = Hasher.hash(new_fingerprint_args)
     cache_file = cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
-    if (not is_main_process()) or (cache_file.exists() and not regenerate_cache):
-        logger.info('Dataset fingerprint matched cache, loading from cache')
+    if not is_main_process():
         assert cache_file.exists()
-    else:
-        logger.info('Dataset fingerprint changed, removing existing cache file and regenerating')
-        for existing_cache_file in cache_dir.glob(f'{cache_file_prefix}*.arrow'):
-            existing_cache_file.unlink()
     # lower writer_batch_size from the default of 1000 or we get a weird pyarrow overflow error
     dataset = dataset.map(
         map_fn,
         cache_file_name=str(cache_file),
+        load_from_cache_file=(not regenerate_cache),
         writer_batch_size=100,
         new_fingerprint=new_fingerprint,
         remove_columns=dataset.column_names,
         batched=True,
         batch_size=caching_batch_size,
+        with_indices=with_indices,
     )
     return dataset
 
@@ -76,8 +75,8 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
-    def __init__(self, image_file_and_caption_dataset, directory_config, size_bucket, model, regenerate_cache=False, caching_batch_size=1):
-        self.image_file_and_caption_dataset = image_file_and_caption_dataset
+    def __init__(self, metadata_dataset, directory_config, size_bucket, model, regenerate_cache=False, caching_batch_size=1):
+        self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.size_bucket = size_bucket
         self.model = model
@@ -86,37 +85,42 @@ class SizeBucketDataset:
         self.path = Path(self.directory_config['path'])
         self.cache_dir = self.path / 'cache' / self.model.name / f'cache_{size_bucket[0]}x{size_bucket[1]}x{size_bucket[2]}'
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.datasets = []
+        self.text_embedding_datasets = []
         self.num_repeats = self.directory_config.get('num_repeats', 1)
         if is_main_process():
-            logger.info(f'size_bucket: {size_bucket}, num_images: {len(self.image_file_and_caption_dataset)}, num_repeats: {self.num_repeats}')
+            logger.info(f'size_bucket: {size_bucket}, num_files: {len(self.metadata_dataset)}, num_repeats: {self.num_repeats}')
 
     def cache_latents(self, vae):
-        self.datasets.append(
-            _map_and_cache(
-                self.image_file_and_caption_dataset,
-                self.model.get_latents_map_fn(vae, self.size_bucket),
-                self.cache_dir,
-                cache_file_prefix='latents_',
-                regenerate_cache=self.regenerate_cache,
-                caching_batch_size=self.caching_batch_size
-            )
+        self.latent_dataset = _map_and_cache(
+            self.metadata_dataset,
+            self.model.get_latents_map_fn(vae, self.size_bucket),
+            self.cache_dir,
+            cache_file_prefix='latents_',
+            regenerate_cache=self.regenerate_cache,
+            caching_batch_size=self.caching_batch_size,
+            with_indices=True,
         )
+        # Shuffle again, since one media file can produce multiple training examples. E.g. video, or maybe
+        # in the future data augmentation. Don't need to shuffle text embeddings since those are looked
+        # up by index.
+        self.latent_dataset = self.latent_dataset.shuffle(seed=123)
+        # TODO: should we do dataset.flatten_indices() to make it contiguous on disk again?
 
-    def add_dataset(self, te_dataset):
-        self.datasets.append(te_dataset)
+    def add_text_embedding_dataset(self, te_dataset):
+        self.text_embedding_datasets.append(te_dataset)
 
     def __getitem__(self, idx):
-        idx = idx % len(self.image_file_and_caption_dataset)
+        idx = idx % len(self.latent_dataset)
+        ret = self.latent_dataset[idx]
+        te_idx = ret['te_idx'].item()
         if DEBUG:
-            print(Path(self.image_file_and_caption_dataset[idx]['image_file']).stem)
-        ret = {}
-        for ds in self.datasets:
-            ret.update(ds[idx])
+            print(Path(self.metadata_dataset[te_idx]['image_file']).stem)
+        for ds in self.text_embedding_datasets:
+            ret.update(ds[te_idx])
         return ret
 
     def __len__(self):
-        return len(self.image_file_and_caption_dataset) * self.num_repeats
+        return len(self.latent_dataset) * self.num_repeats
 
 
 # Logical concatenation of multiple SizeBucketDataset, for the same size bucket. It returns items
@@ -125,6 +129,8 @@ class ConcatenatedBatchedDataset:
     def __init__(self, datasets):
         self.datasets = datasets
         self.post_init_called = False
+
+    def post_init(self, batch_size):
         iteration_order = []
         for i, ds in enumerate(self.datasets):
             iteration_order.extend([i]*len(ds))
@@ -135,8 +141,6 @@ class ConcatenatedBatchedDataset:
             cumulative_sums[dataset_idx] += 1
         self.iteration_order = iteration_order
         assert len(self.iteration_order) > 0, 'ConcatenatedBatchedDataset is empty. Are your file paths correct?'
-
-    def post_init(self, batch_size):
         self.batch_size = batch_size
         self._make_divisible_by(self.batch_size)
         self.post_init_called = True
@@ -159,10 +163,10 @@ class ConcatenatedBatchedDataset:
 
 
 class ARBucketDataset:
-    def __init__(self, ar_frames, resolutions, filepaths, directory_config, model, regenerate_cache=False, caching_batch_size=1):
+    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, model, regenerate_cache=False, caching_batch_size=1):
         self.ar_frames = ar_frames
         self.resolutions = resolutions
-        self.filepaths = filepaths
+        self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.model = model
         self.size_buckets = []
@@ -172,19 +176,6 @@ class ARBucketDataset:
         self.regenerate_cache = regenerate_cache
         self.caching_batch_size = caching_batch_size
 
-        image_and_caption_files = self.filepaths
-        # This is the one place we shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
-        # Processes other than rank 0 will then load it from cache.
-        shuffle_with_seed(image_and_caption_files, seed=0)
-        image_files, caption_files = zip(*image_and_caption_files)
-        ds = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
-        self.image_file_and_caption_dataset = ds.map(
-            process_caption_fn(shuffle_tags=self.directory_config['shuffle_tags'], caption_prefix=self.directory_config['caption_prefix']),
-            remove_columns='caption_file',
-            keep_in_memory=True
-        )
-        self.image_file_and_caption_dataset.set_format('torch')
-
         for res in resolutions:
             area = res**2
             w = math.sqrt(area * self.ar_frames[0])
@@ -193,7 +184,7 @@ class ARBucketDataset:
             h = round_to_multiple(h, IMAGE_SIZE_ROUND_TO_MULTIPLE)
             size_bucket = (w, h, self.ar_frames[1])
             self.size_buckets.append(
-                SizeBucketDataset(self.image_file_and_caption_dataset, directory_config, size_bucket, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+                SizeBucketDataset(self.metadata_dataset, directory_config, size_bucket, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
             )
 
     def get_size_bucket_datasets(self):
@@ -205,7 +196,7 @@ class ARBucketDataset:
 
     def cache_text_embeddings(self, text_encoder, i):
         te_dataset = _map_and_cache(
-            self.image_file_and_caption_dataset,
+            self.metadata_dataset,
             self.model.get_text_embeddings_map_fn(text_encoder),
             self.cache_dir,
             cache_file_prefix=f'text_embeddings_{i}_',
@@ -214,7 +205,7 @@ class ARBucketDataset:
             regenerate_cache=self.regenerate_cache
         )
         for size_bucket_dataset in self.size_buckets:
-            size_bucket_dataset.add_dataset(te_dataset)
+            size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
 
 class DirectoryDataset:
@@ -224,6 +215,8 @@ class DirectoryDataset:
         self.dataset_config = dataset_config
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
         self.resolutions = directory_config.get('resolutions', dataset_config['resolutions'])
+        path = Path(self.directory_config['path'])
+        self.cache_dir = path / 'cache' / model.name
 
         if not self.enable_ar_bucket:
             ars = np.array([1.0])
@@ -232,17 +225,17 @@ class DirectoryDataset:
             max_ar = self.directory_config.get('max_ar', self.dataset_config['max_ar'])
             num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
             ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
-        log_ars = np.log(ars)
         frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
         frame_buckets = np.array(frame_buckets)
 
-        ar_bucket_to_filepaths = defaultdict(list)
-        path = Path(self.directory_config['path'])
         if not path.exists() or not path.is_dir():
             raise RuntimeError(f'Invalid path: {path}')
         files = list(Path(path).glob('*'))
         # deterministic order
         files.sort()
+
+        image_files = []
+        caption_files = []
         for file in files:
             if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz':
                 continue
@@ -252,17 +245,33 @@ class DirectoryDataset:
                 if is_main_process():
                     logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
                 continue
-            ar_bucket = self._find_closest_ar_bucket(image_file, ars, log_ars, frame_buckets)
-            if ar_bucket is not None:
-                ar_bucket_to_filepaths[ar_bucket].append((str(image_file), str(caption_file)))
-
+            image_files.append(str(image_file))
+            caption_files.append(str(caption_file))
+        metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
+        # Shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
+        # Processes other than rank 0 will then load it from cache.
+        metadata_dataset = metadata_dataset.shuffle(seed=0)
+        metadata_dataset = metadata_dataset.map(
+            self._metadata_map_fn(ars, frame_buckets),
+            cache_file_name=str(self.cache_dir / 'metadata/metadata.arrow'),
+            load_from_cache_file=(not regenerate_cache),
+            num_proc=NUM_PROC,
+        )
+        grouped_metadata = defaultdict(lambda: defaultdict(list))
+        for example in metadata_dataset:
+            ar_bucket = example['ar_bucket']
+            ar_bucket = (ar_bucket[0], int(ar_bucket[1]))
+            d = grouped_metadata[ar_bucket]
+            for k, v in example.items():
+                d[k].append(v)
         self.ar_buckets = []
-        for ar_bucket, filepaths in ar_bucket_to_filepaths.items():
+        for ar_bucket, metadata in grouped_metadata.items():
+            metadata = datasets.Dataset.from_dict(metadata)
             self.ar_buckets.append(
                 ARBucketDataset(
                     ar_bucket,
                     self.resolutions,
-                    filepaths,
+                    metadata,
                     directory_config,
                     model,
                     regenerate_cache=regenerate_cache,
@@ -276,24 +285,48 @@ class DirectoryDataset:
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
 
-    def _find_closest_ar_bucket(self, image_file, ars, log_ars, frame_buckets):
-        try:
-            if image_file.suffix in VIDEO_EXTENSIONS:
-                img = imageio.v3.imread(image_file)
-                frames, height, width = img.shape[-4:-1]
-            else:
-                pil_img = Image.open(image_file)
-                width, height = pil_img.size
-                frames = 1
-        except Exception:
-            if is_main_process():
-                logger.warning(f'Image file {image_file} could not be opened. Skipping.')
-            return None
-        log_ar = np.log(width / height)
-        # Best AR bucket is the one with the smallest AR difference in log space.
-        i = np.argmin(np.abs(log_ar - log_ars))
-        j = np.argmin(np.abs(frames - frame_buckets))
-        return (ars[i], frame_buckets[j])
+    def _metadata_map_fn(self, ars, frame_buckets):
+        log_ars = np.log(ars)
+        def fn(example):
+            with open(example['caption_file']) as f:
+                caption = f.read().strip()
+            if self.directory_config['shuffle_tags']:
+                tags = [tag.strip() for tag in caption.split(',')]
+                random.shuffle(tags)
+                caption = ', '.join(tags)
+            caption = self.directory_config['caption_prefix'] + caption
+
+            image_file = Path(example['image_file'])
+            try:
+                if image_file.suffix in VIDEO_EXTENSIONS:
+                    # 100% accurate frame count, but much slower.
+                    # frames = 0
+                    # for frame in imageio.v3.imiter(image_file):
+                    #     frames += 1
+                    #     height, width = frame.shape[:2]
+                    # TODO: this is an estimate of frame count. What happens if variable frame rate? Is
+                    # it still close enough?
+                    meta = imageio.v3.immeta(image_file)
+                    height, width = meta['size']
+                    frames = int(meta['fps'] * meta['duration'])
+                else:
+                    pil_img = Image.open(image_file)
+                    width, height = pil_img.size
+                    frames = 1
+            except Exception:
+                if is_main_process():
+                    logger.warning(f'Image file {image_file} could not be opened. Skipping.')
+                return None
+            log_ar = np.log(width / height)
+            # Best AR bucket is the one with the smallest AR difference in log space.
+            i = np.argmin(np.abs(log_ar - log_ars))
+            # TODO: fix this. We drop any video with frames less than the bucket. So this won't work right at all with
+            # more than one frame bucket.
+            j = np.argmin(np.abs(frames - frame_buckets))
+            ar_bucket = (ars[i], frame_buckets[j])
+
+            return {'caption': caption, 'ar_bucket': ar_bucket}
+        return fn
 
     def get_size_bucket_datasets(self):
         result = []

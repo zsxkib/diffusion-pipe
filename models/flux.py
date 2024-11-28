@@ -136,7 +136,7 @@ def decode_latents_to_pil(latents, vae):
 
 def process_image_fn(vae, size_bucket):
     width_height = size_bucket[:2]
-    def fn(example):
+    def fn(example, indices):
         pil_imgs = []
         for image_file in example['image_file']:
             try:
@@ -148,7 +148,7 @@ def process_image_fn(vae, size_bucket):
             pil_imgs.append(pil_img)
 
         latents = encode_pil_to_latents(pil_imgs, vae)
-        return {'latents': latents}
+        return {'latents': latents, 'te_idx': indices}
 
     return fn
 

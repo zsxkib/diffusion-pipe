@@ -11,8 +11,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torchvision
-from diffusers.image_processor import VaeImageProcessor
 import numpy as np
+from PIL import ImageOps
+from torchvision import transforms
 
 from models.base import BasePipeline
 from utils import common
@@ -54,48 +55,73 @@ def load_scheduler(scheduler_dir):
     return RectifiedFlowScheduler.from_config(scheduler_config)
 
 
-def pad_or_truncate_frames(video, target_frames):
-    frames = video.shape[0]
-    if frames >= target_frames:
-        return video[:target_frames]
-    # pad
-    num_padding_frames = target_frames - frames
-    # amount of padding (before, after) for each axis
-    pad_width = ((0, num_padding_frames), (0, 0), (0, 0), (0, 0))
-    return np.pad(video, pad_width=pad_width, mode='constant', constant_values=0.)
+def extract_clips(video, target_frames):
+    # video is (channels, num_frames, height, width)
+    frames = video.shape[1]
+    if frames < target_frames:
+        # TODO: think about how to handle this case. Maybe the video should have already been thrown out?
+        print(f'video with shape {video.shape} is being skipped because it has less than the target_frames')
+        return []
+    # extract multiple clips so we use the whole video for training
+    num_clips = ((frames - 1) // target_frames) + 1
+    start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
+    return [video[:, i:i+target_frames, ...] for i in start_indices]
 
+
+pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
 def process_video_fn(vae, size_bucket):
-    image_processor = VaeImageProcessor(vae_scale_factor=32)
-    def fn(example):
+    width, height, frames = size_bucket
+    height_padded = ((height - 1) // 32 + 1) * 32
+    width_padded = ((width - 1) // 32 + 1) * 32
+    frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
+
+    def fn(example, indices):
         videos = []
-        for path in example['image_file']:
+        te_idx = []
+        video_batch = None
+        for idx, path in zip(indices, example['image_file']):
             is_video = (Path(path).suffix in common.VIDEO_EXTENSIONS)
+            if video_batch is None:
+                video_batch = is_video
+            assert is_video == video_batch  # videos and images should never be in same size bucket
             if is_video:
-                video = imageio.v3.imread(path, fps=FRAMERATE)
+                frames = imageio.v3.imiter(path, fps=FRAMERATE)
             else:
-                video = imageio.v3.imread(path)
-            if video.ndim == 3:
-                # make image have 1 frame
-                video = video[None, ...]
+                frames = [imageio.v3.imread(path)]
 
-            width, height, frames = size_bucket
-            height_padded = ((height - 1) // 32 + 1) * 32
-            width_padded = ((width - 1) // 32 + 1) * 32
-            frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
+            torch_frames = []
+            for frame in frames:
+                pil_image = torchvision.transforms.functional.to_pil_image(frame)
+                cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
+                torch_frames.append(pil_to_tensor(cropped_image))
 
-            video = pad_or_truncate_frames(video, frames_padded)
-
-            images = [torchvision.transforms.functional.to_pil_image(frame) for frame in video]
-            video = image_processor.preprocess(images, height=height_padded, width=width_padded, resize_mode='crop')
+            video = torch.stack(torch_frames)
+            del torch_frames # save memory
             # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
             video = torch.permute(video, (1, 0, 2, 3))
 
-            videos.append(video)
+            clips = extract_clips(video, frames_padded)
+            del video # save memory
+            videos.extend(clips)
+            # one video can be mapped into multiple videos, so we need to keep track of the index for looking up text embeddings
+            te_idx.extend([idx] * len(clips))
 
-        video = torch.stack(videos)
-        latents = vae_encode(video.to(vae.device, vae.dtype), vae, vae_per_channel_normalize=True)
-        return {'latents': latents.to('cpu')}
+        if len(videos) == 0:
+            # technically possible; all videos could have been dropped because they're less than the size_bucket frames
+            return None
+
+        caching_batch_size = len(example['image_file'])
+        if videos[0].shape[1] > 1:
+            # VAE uses a lot of memory for videos, so always use a batch size of 1
+            caching_batch_size = 1
+        latents_list = []
+        for i in range(0, len(videos), caching_batch_size):
+            batched = torch.stack(videos[i:i+caching_batch_size])
+            latents = vae_encode(batched.to(vae.device, vae.dtype), vae, vae_per_channel_normalize=True)
+            latents_list.append(latents)
+        latents = torch.cat(latents_list)
+        return {'latents': latents.to('cpu'), 'te_idx': te_idx}
 
     return fn
 
