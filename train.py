@@ -201,11 +201,12 @@ if __name__ == '__main__':
     #     pil_image.save('test.jpg')
     # quit()
 
-    dataset_manager = dataset_util.DatasetManager(model)
     with open(config['dataset']) as f:
         dataset_config = toml.load(f)
     caching_batch_size = config.get('caching_batch_size', 1)
-    train_data = dataset_util.Dataset(dataset_config, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+
+    train_data = dataset_util.Dataset(dataset_config, model.name)
     dataset_manager.register(train_data)
 
     eval_data_map = {}
@@ -218,7 +219,7 @@ if __name__ == '__main__':
             config_path = eval_dataset['config']
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model.name)
         dataset_manager.register(eval_data_map[name])
 
     dataset_manager.cache()
@@ -359,6 +360,7 @@ if __name__ == '__main__':
     model_engine.lr_scheduler = lr_scheduler
 
     train_data.post_init(
+        model,
         model_engine.grid.get_data_parallel_rank(),
         model_engine.grid.get_data_parallel_world_size(),
         model_engine.train_micro_batch_size_per_gpu(),
@@ -366,6 +368,7 @@ if __name__ == '__main__':
     )
     for eval_data in eval_data_map.values():
         eval_data.post_init(
+            model,
             model_engine.grid.get_data_parallel_rank(),
             model_engine.grid.get_data_parallel_world_size(),
             config.get('eval_batch_size', model_engine.train_micro_batch_size_per_gpu()),

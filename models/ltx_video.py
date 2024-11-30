@@ -70,17 +70,17 @@ def extract_clips(video, target_frames):
 
 pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
-def process_video_fn(vae, size_bucket):
-    width, height, frames = size_bucket
-    height_padded = ((height - 1) // 32 + 1) * 32
-    width_padded = ((width - 1) // 32 + 1) * 32
-    frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
-
+def process_video_fn(vae):
     def fn(example, indices):
+        width, height, frames = first_size_bucket = example['size_bucket'][0]
+        height_padded = ((height - 1) // 32 + 1) * 32
+        width_padded = ((width - 1) // 32 + 1) * 32
+        frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
         videos = []
         te_idx = []
         video_batch = None
-        for idx, path in zip(indices, example['image_file']):
+        for idx, path, size_bucket in zip(indices, example['image_file'], example['size_bucket']):
+            assert size_bucket == first_size_bucket
             is_video = (Path(path).suffix in common.VIDEO_EXTENSIONS)
             if video_batch is None:
                 video_batch = is_video
@@ -177,8 +177,8 @@ class LTXVideoPipeline(BasePipeline):
     def save_model(self, save_dir, diffusers_sd):
         raise NotImplementedError()
 
-    def get_latents_map_fn(self, vae, size_bucket):
-        return process_video_fn(vae, size_bucket)
+    def get_latents_map_fn(self, vae):
+        return process_video_fn(vae)
 
     def get_text_embeddings_map_fn(self, text_encoder):
         def fn(example):

@@ -254,6 +254,7 @@ class FluxPipeline(BasePipeline):
 
         save_file(flux_sd, save_dir / 'model.safetensors', metadata={"format": "pt"})
 
+    # TODO: update this to work with latest changes
     def get_latents_map_fn(self, vae, size_bucket):
         return process_image_fn(vae, size_bucket)
 

@@ -75,29 +75,27 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
-    def __init__(self, metadata_dataset, directory_config, size_bucket, model, regenerate_cache=False, caching_batch_size=1):
+    def __init__(self, metadata_dataset, directory_config, size_bucket, model_name):
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.size_bucket = size_bucket
-        self.model = model
-        self.regenerate_cache = regenerate_cache
-        self.caching_batch_size = caching_batch_size
+        self.model_name = model_name
         self.path = Path(self.directory_config['path'])
-        self.cache_dir = self.path / 'cache' / self.model.name / f'cache_{size_bucket[0]}x{size_bucket[1]}x{size_bucket[2]}'
+        self.cache_dir = self.path / 'cache' / self.model_name / f'cache_{size_bucket[0]}x{size_bucket[1]}x{size_bucket[2]}'
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
         self.num_repeats = self.directory_config.get('num_repeats', 1)
         if is_main_process():
             logger.info(f'size_bucket: {size_bucket}, num_files: {len(self.metadata_dataset)}, num_repeats: {self.num_repeats}')
 
-    def cache_latents(self, vae):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
-            self.model.get_latents_map_fn(vae, self.size_bucket),
+            map_fn,
             self.cache_dir,
             cache_file_prefix='latents_',
-            regenerate_cache=self.regenerate_cache,
-            caching_batch_size=self.caching_batch_size,
+            regenerate_cache=regenerate_cache,
+            caching_batch_size=caching_batch_size,
             with_indices=True,
         )
         # Shuffle again, since one media file can produce multiple training examples. E.g. video, or maybe
@@ -163,18 +161,16 @@ class ConcatenatedBatchedDataset:
 
 
 class ARBucketDataset:
-    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, model, regenerate_cache=False, caching_batch_size=1):
+    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, model_name):
         self.ar_frames = ar_frames
         self.resolutions = resolutions
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
-        self.model = model
+        self.model_name = model_name
         self.size_buckets = []
         self.path = Path(directory_config['path'])
-        self.cache_dir = self.path / 'cache' / self.model.name / f'ar_frames_{self.ar_frames[0]:.3f}_{self.ar_frames[1]}'
+        self.cache_dir = self.path / 'cache' / self.model_name / f'ar_frames_{self.ar_frames[0]:.3f}_{self.ar_frames[1]}'
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.regenerate_cache = regenerate_cache
-        self.caching_batch_size = caching_batch_size
 
         for res in resolutions:
             area = res**2
@@ -183,54 +179,58 @@ class ARBucketDataset:
             w = round_to_multiple(w, IMAGE_SIZE_ROUND_TO_MULTIPLE)
             h = round_to_multiple(h, IMAGE_SIZE_ROUND_TO_MULTIPLE)
             size_bucket = (w, h, self.ar_frames[1])
+            metadata_with_size_bucket = self.metadata_dataset.map(lambda example: {'size_bucket': size_bucket}, keep_in_memory=True)
             self.size_buckets.append(
-                SizeBucketDataset(self.metadata_dataset, directory_config, size_bucket, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+                SizeBucketDataset(metadata_with_size_bucket, directory_config, size_bucket, model_name)
             )
 
     def get_size_bucket_datasets(self):
         return self.size_buckets
 
-    def cache_latents(self, vae):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         for ds in self.size_buckets:
-            ds.cache_latents(vae)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
-    def cache_text_embeddings(self, text_encoder, i):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         te_dataset = _map_and_cache(
             self.metadata_dataset,
-            self.model.get_text_embeddings_map_fn(text_encoder),
+            map_fn,
             self.cache_dir,
             cache_file_prefix=f'text_embeddings_{i}_',
             new_fingerprint_args=[i],
-            caching_batch_size=self.caching_batch_size,
-            regenerate_cache=self.regenerate_cache
+            regenerate_cache=regenerate_cache,
+            caching_batch_size=caching_batch_size,
         )
         for size_bucket_dataset in self.size_buckets:
             size_bucket_dataset.add_text_embedding_dataset(te_dataset)
 
 
 class DirectoryDataset:
-    def __init__(self, directory_config, dataset_config, model, regenerate_cache=False, caching_batch_size=1):
+    def __init__(self, directory_config, dataset_config, model_name):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         self.dataset_config = dataset_config
+        self.model_name = model_name
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
         self.resolutions = directory_config.get('resolutions', dataset_config['resolutions'])
-        path = Path(self.directory_config['path'])
-        self.cache_dir = path / 'cache' / model.name
+        self.path = Path(self.directory_config['path'])
+        self.cache_dir = self.path / 'cache' / self.model_name
+
+        if not self.path.exists() or not self.path.is_dir():
+            raise RuntimeError(f'Invalid path: {self.path}')
 
         if not self.enable_ar_bucket:
-            ars = np.array([1.0])
+            self.ars = np.array([1.0])
         else:
             min_ar = self.directory_config.get('min_ar', self.dataset_config['min_ar'])
             max_ar = self.directory_config.get('max_ar', self.dataset_config['max_ar'])
             num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
-            ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
+            self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
         frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
-        frame_buckets = np.array(frame_buckets)
+        self.frame_buckets = np.array(frame_buckets)
 
-        if not path.exists() or not path.is_dir():
-            raise RuntimeError(f'Invalid path: {path}')
-        files = list(Path(path).glob('*'))
+    def cache_metadata(self, regenerate_cache=False):
+        files = list(self.path.glob('*'))
         # deterministic order
         files.sort()
 
@@ -252,7 +252,7 @@ class DirectoryDataset:
         # Processes other than rank 0 will then load it from cache.
         metadata_dataset = metadata_dataset.shuffle(seed=0)
         metadata_dataset = metadata_dataset.map(
-            self._metadata_map_fn(ars, frame_buckets),
+            self._metadata_map_fn(self.ars, self.frame_buckets),
             cache_file_name=str(self.cache_dir / 'metadata/metadata.arrow'),
             load_from_cache_file=(not regenerate_cache),
             num_proc=NUM_PROC,
@@ -272,10 +272,8 @@ class DirectoryDataset:
                     ar_bucket,
                     self.resolutions,
                     metadata,
-                    directory_config,
-                    model,
-                    regenerate_cache=regenerate_cache,
-                    caching_batch_size=caching_batch_size,
+                    self.directory_config,
+                    self.model_name,
                 )
             )
 
@@ -334,43 +332,46 @@ class DirectoryDataset:
             result.extend(ar_bucket_dataset.get_size_bucket_datasets())
         return result
 
-    def cache_latents(self, vae):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         for ds in self.ar_buckets:
-            ds.cache_latents(vae)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
-    def cache_text_embeddings(self, text_encoder, i):
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         for ds in self.ar_buckets:
-            ds.cache_text_embeddings(text_encoder, i)
+            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
 
 # Outermost dataset object that the caller uses. Contains multiple ConcatenatedBatchedDataset. Responsible
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
 class Dataset:
-    def __init__(self, dataset_config, model, regenerate_cache=False, caching_batch_size=1):
+    def __init__(self, dataset_config, model_name):
         super().__init__()
         self.dataset_config = dataset_config
-        self.model = model
+        self.model_name = model_name
         self.post_init_called = False
         self.eval_quantile = None
 
         self.directory_datasets = []
-        datasets_by_size_bucket = defaultdict(list)
         for directory_config in dataset_config['directory']:
-            directory_dataset = DirectoryDataset(directory_config, dataset_config, model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+            directory_dataset = DirectoryDataset(directory_config, dataset_config, model_name)
             self.directory_datasets.append(directory_dataset)
-            for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
-                datasets_by_size_bucket[size_bucket_dataset.size_bucket].append(size_bucket_dataset)
 
-        self.buckets = []
-        for datasets in datasets_by_size_bucket.values():
-            self.buckets.append(ConcatenatedBatchedDataset(datasets))
-
-    def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
+    def post_init(self, model, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
+        self.model = model
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_world_size = data_parallel_world_size
         self.batch_size = per_device_batch_size * gradient_accumulation_steps
         self.global_batch_size = self.data_parallel_world_size * self.batch_size
+
+        # group same size_bucket together
+        datasets_by_size_bucket = defaultdict(list)
+        for directory_dataset in self.directory_datasets:
+            for size_bucket_dataset in directory_dataset.get_size_bucket_datasets():
+                datasets_by_size_bucket[size_bucket_dataset.size_bucket].append(size_bucket_dataset)
+        self.buckets = []
+        for datasets in datasets_by_size_bucket.values():
+            self.buckets.append(ConcatenatedBatchedDataset(datasets))
 
         for bucket in self.buckets:
             bucket.post_init(self.global_batch_size)
@@ -420,20 +421,26 @@ class Dataset:
             ret[key] = torch.stack([example[key] for example in examples])
         return ret
 
-    def cache_latents(self, vae):
+    def cache_metadata(self, regenerate_cache=False):
         for ds in self.directory_datasets:
-            ds.cache_latents(vae)
+            ds.cache_metadata(regenerate_cache=regenerate_cache)
 
-    def cache_text_embeddings(self, text_encoder, i):
+    def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         for ds in self.directory_datasets:
-            ds.cache_text_embeddings(text_encoder, i)
+            ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+
+    def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+        for ds in self.directory_datasets:
+            ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
 
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
-    def __init__(self, model):
+    def __init__(self, model, regenerate_cache=False, caching_batch_size=1):
         self.model = model
+        self.regenerate_cache = regenerate_cache
+        self.caching_batch_size = caching_batch_size
         self.datasets = []
 
     def register(self, dataset):
@@ -445,12 +452,15 @@ class DatasetManager:
 
     @torch.no_grad()
     def _cache(self):
+        for ds in self.datasets:
+            ds.cache_metadata(regenerate_cache=self.regenerate_cache)
+
         vae = self.model.get_vae()
         if is_main_process():
             vae.to('cuda')
             logger.info('Caching latents')
         for ds in self.datasets:
-            ds.cache_latents(vae)
+            ds.cache_latents(self.model.get_latents_map_fn(vae), regenerate_cache=self.regenerate_cache, caching_batch_size=self.caching_batch_size)
         vae.to('cpu')
         empty_cuda_cache()
 
@@ -459,7 +469,7 @@ class DatasetManager:
                 text_encoder.to('cuda')
                 logger.info(f'Caching text embeddings {i}')
             for ds in self.datasets:
-                ds.cache_text_embeddings(text_encoder, i)
+                ds.cache_text_embeddings(self.model.get_text_embeddings_map_fn(text_encoder), i, regenerate_cache=self.regenerate_cache, caching_batch_size=self.caching_batch_size)
             text_encoder.to('cpu')
             empty_cuda_cache()
 
