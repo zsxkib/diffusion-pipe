@@ -14,6 +14,6 @@ tensorboard
 tqdm
 safetensors
 bitsandbytes
-imageio
+imageio[ffmpeg]
 av
 einops

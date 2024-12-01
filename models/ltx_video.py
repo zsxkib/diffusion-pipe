@@ -15,7 +15,7 @@ from PIL import ImageOps
 from torchvision import transforms
 
 from models.base import BasePipeline
-from utils import common
+from utils.common import VIDEO_EXTENSIONS
 from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
 from ltx_video.models.autoencoders.causal_video_autoencoder import CausalVideoAutoencoder
 from ltx_video.models.transformers.transformer3d import Transformer3DModel
@@ -54,48 +54,60 @@ def load_scheduler(scheduler_dir):
     return RectifiedFlowScheduler.from_config(scheduler_config)
 
 
-def extract_clips(video, target_frames):
+def extract_clips(video, target_frames, config):
     # video is (channels, num_frames, height, width)
     frames = video.shape[1]
     if frames < target_frames:
         # TODO: think about how to handle this case. Maybe the video should have already been thrown out?
         print(f'video with shape {video.shape} is being skipped because it has less than the target_frames')
         return []
-    # extract multiple clips so we use the whole video for training
-    num_clips = ((frames - 1) // target_frames) + 1
-    start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
-    return [video[:, i:i+target_frames, ...] for i in start_indices]
 
-
-pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-
-def _preprocess_media_file_fn(filepath, size_bucket):
-    width, height, frames = size_bucket
-    height_padded = ((height - 1) // 32 + 1) * 32
-    width_padded = ((width - 1) // 32 + 1) * 32
-    frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
-
-    videos = []
-    is_video = (Path(filepath).suffix in common.VIDEO_EXTENSIONS)
-    if is_video:
-        frames = imageio.v3.imiter(filepath, fps=FRAMERATE)
+    video_clip_mode = config.get('video_clip_mode', 'single_middle')
+    if video_clip_mode == 'single_beginning':
+        return [video[:, :target_frames, ...]]
+    elif video_clip_mode == 'single_middle':
+        start = int((frames - target_frames) / 2)
+        assert frames-start >= target_frames
+        return [video[:, start:start+target_frames, ...]]
+    elif video_clip_mode == 'multiple_overlapping':
+        # Extract multiple clips so we use the whole video for training.
+        # The clips might overlap a little bit. We never cut anything off the end of the video.
+        num_clips = ((frames - 1) // target_frames) + 1
+        start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
+        return [video[:, i:i+target_frames, ...] for i in start_indices]
     else:
-        frames = [imageio.v3.imread(filepath)]
+        raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
 
-    torch_frames = []
-    for frame in frames:
-        pil_image = torchvision.transforms.functional.to_pil_image(frame)
-        cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
-        torch_frames.append(pil_to_tensor(cropped_image))
 
-    video = torch.stack(torch_frames)
-    del torch_frames # save memory
-    # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
-    video = torch.permute(video, (1, 0, 2, 3))
+class PreprocessMediaFile:
+    def __init__(self, config):
+        self.config = config
+        self.pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
-    clips = extract_clips(video, frames_padded)
-    videos.extend(clips)
-    return videos
+    def __call__(self, filepath, size_bucket):
+        width, height, frames = size_bucket
+        height_padded = ((height - 1) // 32 + 1) * 32
+        width_padded = ((width - 1) // 32 + 1) * 32
+        frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
+
+        is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
+        if is_video:
+            frames = imageio.v3.imiter(filepath, fps=FRAMERATE)
+        else:
+            frames = [imageio.v3.imread(filepath)]
+
+        torch_frames = []
+        for frame in frames:
+            pil_image = torchvision.transforms.functional.to_pil_image(frame)
+            cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
+            torch_frames.append(self.pil_to_tensor(cropped_image))
+
+        video = torch.stack(torch_frames)
+        del torch_frames # save memory
+        # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
+        video = torch.permute(video, (1, 0, 2, 3))
+
+        return extract_clips(video, frames_padded, self.config)
 
 
 class LTXVideoPipeline(BasePipeline):
@@ -150,8 +162,7 @@ class LTXVideoPipeline(BasePipeline):
         raise NotImplementedError()
 
     def get_preprocess_media_file_fn(self):
-        # needs to return a top-level function so that it can be pickled and sent to a subprocess
-        return _preprocess_media_file_fn
+        return PreprocessMediaFile(self.config)
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):

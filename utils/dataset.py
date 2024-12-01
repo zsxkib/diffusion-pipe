@@ -4,7 +4,6 @@ import random
 from collections import defaultdict
 import math
 import os
-import torch.multiprocessing as mp
 
 import numpy as np
 import torch
@@ -14,13 +13,14 @@ import datasets
 from datasets.fingerprint import Hasher
 from PIL import Image
 import imageio
+import torch.multiprocessing as mp
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS
 
 
 DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
-NUM_PROC = min(32, os.cpu_count())
+NUM_PROC = min(8, os.cpu_count())
 
 
 def shuffle_with_seed(l, seed=None):
@@ -67,7 +67,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         batched=True,
         batch_size=caching_batch_size,
         with_indices=with_indices,
-        num_proc=NUM_PROC,
+        #num_proc=NUM_PROC,
     )
     return dataset
 
@@ -429,6 +429,11 @@ class Dataset:
 
 
 def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, caching_batch_size):
+    # Dataset map() starts a bunch of processes. Make sure torch uses a limited number of threads
+    # to avoid CPU contention.
+    # TODO: if we ever change Datasets map to use spawn instead of fork, this might not work.
+    torch.set_num_threads(os.cpu_count() // NUM_PROC)
+
     for ds in datasets:
         ds.cache_metadata(regenerate_cache=regenerate_cache)
 
@@ -443,8 +448,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             te_idx.extend([idx] * len(items))
 
         if len(tensors) == 0:
-            # TODO: haven't tested this, maybe returning None isn't the right thing and need to return empty dict
-            return None
+            return {'latents': [], 'te_idx': []}
 
         caching_batch_size = len(example['image_file'])
         results = defaultdict(list)
