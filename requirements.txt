@@ -1,3 +1,5 @@
+torch
+torchvision
 deepspeed
 toml
 transformers
@@ -14,3 +16,4 @@ safetensors
 bitsandbytes
 imageio
 av
+einops

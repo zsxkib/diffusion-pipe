@@ -7,19 +7,19 @@ import time
 import random
 import json
 import inspect
-from pathlib import Path
+import torch.multiprocessing as mp
 
 import toml
 import deepspeed
+from deepspeed import comm as dist
 from deepspeed.runtime.pipe import module as ds_pipe_module
 import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import safetensors.torch
 
 from utils import dataset as dataset_util
-from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
+from utils.common import is_main_process, get_rank, DTYPE_MAP
 import utils.saver
 from utils.isolate_rng import isolate_rng
 from models import flux, ltx_video
@@ -165,6 +165,11 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
 
 
 if __name__ == '__main__':
+    # workaround for https://github.com/pytorch/pytorch/issues/10996
+    mp.set_start_method('spawn')
+    # needed for broadcasting Queue in dataset.py
+    mp.current_process().authkey = b'afsaskgfdjh4'
+
     with open(args.config) as f:
         config = toml.load(f)
     with open(args.deepspeed_config) as f:
@@ -182,6 +187,8 @@ if __name__ == '__main__':
     )
 
     deepspeed.init_distributed()
+    # needed for broadcasting Queue in dataset.py (because we haven't called deepspeed.initialize() yet?)
+    torch.cuda.set_device(dist.get_rank())
 
     model_type = config['model']['type']
 
@@ -240,7 +247,7 @@ if __name__ == '__main__':
         shutil.copy(args.config, run_dir)
         shutil.copy(args.deepspeed_config, run_dir)
     # wait for all processes then get the most recent dir (may have just been created)
-    deepspeed.comm.barrier()
+    dist.barrier()
     run_dir = get_most_recent_run_dir(config['output_dir'])
 
     layers = model.to_layers()
@@ -391,7 +398,7 @@ if __name__ == '__main__':
             load_module_strict=False,
             load_lr_scheduler_states='force_constant_lr' not in config,
         )
-        deepspeed.comm.barrier()  # just so the print below doesn't get swamped
+        dist.barrier()  # just so the print below doesn't get swamped
         assert load_path is not None
         train_dataloader.load_state_dict(client_state['custom_loader'])
         step = client_state['step'] + 1

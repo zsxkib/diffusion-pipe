@@ -11,7 +11,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torchvision
-import numpy as np
 from PIL import ImageOps
 from torchvision import transforms
 
@@ -70,60 +69,33 @@ def extract_clips(video, target_frames):
 
 pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
-def process_video_fn(vae):
-    def fn(example, indices):
-        width, height, frames = first_size_bucket = example['size_bucket'][0]
-        height_padded = ((height - 1) // 32 + 1) * 32
-        width_padded = ((width - 1) // 32 + 1) * 32
-        frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
-        videos = []
-        te_idx = []
-        video_batch = None
-        for idx, path, size_bucket in zip(indices, example['image_file'], example['size_bucket']):
-            assert size_bucket == first_size_bucket
-            is_video = (Path(path).suffix in common.VIDEO_EXTENSIONS)
-            if video_batch is None:
-                video_batch = is_video
-            assert is_video == video_batch  # videos and images should never be in same size bucket
-            if is_video:
-                frames = imageio.v3.imiter(path, fps=FRAMERATE)
-            else:
-                frames = [imageio.v3.imread(path)]
+def _preprocess_media_file_fn(filepath, size_bucket):
+    width, height, frames = size_bucket
+    height_padded = ((height - 1) // 32 + 1) * 32
+    width_padded = ((width - 1) // 32 + 1) * 32
+    frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
 
-            torch_frames = []
-            for frame in frames:
-                pil_image = torchvision.transforms.functional.to_pil_image(frame)
-                cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
-                torch_frames.append(pil_to_tensor(cropped_image))
+    videos = []
+    is_video = (Path(filepath).suffix in common.VIDEO_EXTENSIONS)
+    if is_video:
+        frames = imageio.v3.imiter(filepath, fps=FRAMERATE)
+    else:
+        frames = [imageio.v3.imread(filepath)]
 
-            video = torch.stack(torch_frames)
-            del torch_frames # save memory
-            # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
-            video = torch.permute(video, (1, 0, 2, 3))
+    torch_frames = []
+    for frame in frames:
+        pil_image = torchvision.transforms.functional.to_pil_image(frame)
+        cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
+        torch_frames.append(pil_to_tensor(cropped_image))
 
-            clips = extract_clips(video, frames_padded)
-            del video # save memory
-            videos.extend(clips)
-            # one video can be mapped into multiple videos, so we need to keep track of the index for looking up text embeddings
-            te_idx.extend([idx] * len(clips))
+    video = torch.stack(torch_frames)
+    del torch_frames # save memory
+    # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
+    video = torch.permute(video, (1, 0, 2, 3))
 
-        if len(videos) == 0:
-            # technically possible; all videos could have been dropped because they're less than the size_bucket frames
-            return None
-
-        caching_batch_size = len(example['image_file'])
-        if videos[0].shape[1] > 1:
-            # VAE uses a lot of memory for videos, so always use a batch size of 1
-            caching_batch_size = 1
-        latents_list = []
-        for i in range(0, len(videos), caching_batch_size):
-            batched = torch.stack(videos[i:i+caching_batch_size])
-            latents = vae_encode(batched.to(vae.device, vae.dtype), vae, vae_per_channel_normalize=True)
-            latents_list.append(latents)
-        latents = torch.cat(latents_list)
-        return {'latents': latents.to('cpu'), 'te_idx': te_idx}
-
-    return fn
+    clips = extract_clips(video, frames_padded)
+    videos.extend(clips)
+    return videos
 
 
 class LTXVideoPipeline(BasePipeline):
@@ -177,17 +149,23 @@ class LTXVideoPipeline(BasePipeline):
     def save_model(self, save_dir, diffusers_sd):
         raise NotImplementedError()
 
-    def get_latents_map_fn(self, vae):
-        return process_video_fn(vae)
+    def get_preprocess_media_file_fn(self):
+        # needs to return a top-level function so that it can be pickled and sent to a subprocess
+        return _preprocess_media_file_fn
 
-    def get_text_embeddings_map_fn(self, text_encoder):
-        def fn(example):
+    def get_call_vae_fn(self, vae):
+        def fn(tensor):
+            return {'latents': vae_encode(tensor.to(vae.device, vae.dtype), vae, vae_per_channel_normalize=True)}
+        return fn
+
+    def get_call_text_encoder_fn(self, text_encoder):
+        def fn(caption):
             (
                 prompt_embeds,
                 prompt_attention_mask,
                 negative_prompt_embeds,
                 negative_prompt_attention_mask,
-            ) = self.encode_prompt(example['caption'], do_classifier_free_guidance=False, device=text_encoder.device)
+            ) = self.encode_prompt(caption, do_classifier_free_guidance=False, device=text_encoder.device)
             return {'prompt_embeds': prompt_embeds, 'prompt_attention_mask': prompt_attention_mask}
         return fn
 

@@ -4,7 +4,9 @@ import random
 from collections import defaultdict
 import math
 import os
+import torch.multiprocessing as mp
 
+import numpy as np
 import torch
 from deepspeed.utils.logging import logger
 from deepspeed import comm as dist
@@ -12,14 +14,13 @@ import datasets
 from datasets.fingerprint import Hasher
 from PIL import Image
 import imageio
-import numpy as np
 
-from utils.common import zero_first, empty_cuda_cache, is_main_process, VIDEO_EXTENSIONS
+from utils.common import is_main_process, VIDEO_EXTENSIONS
 
 
 DEBUG = False
 IMAGE_SIZE_ROUND_TO_MULTIPLE = 32
-NUM_PROC = min(64, os.cpu_count())
+NUM_PROC = min(32, os.cpu_count())
 
 
 def shuffle_with_seed(l, seed=None):
@@ -55,12 +56,10 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     new_fingerprint_args.append(dataset._fingerprint)
     new_fingerprint = Hasher.hash(new_fingerprint_args)
     cache_file = cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
-    if not is_main_process():
-        assert cache_file.exists()
-    # lower writer_batch_size from the default of 1000 or we get a weird pyarrow overflow error
+    cache_file = str(cache_file)
     dataset = dataset.map(
         map_fn,
-        cache_file_name=str(cache_file),
+        cache_file_name=cache_file,
         load_from_cache_file=(not regenerate_cache),
         writer_batch_size=100,
         new_fingerprint=new_fingerprint,
@@ -68,6 +67,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         batched=True,
         batch_size=caching_batch_size,
         with_indices=with_indices,
+        num_proc=NUM_PROC,
     )
     return dataset
 
@@ -85,8 +85,6 @@ class SizeBucketDataset:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
         self.num_repeats = self.directory_config.get('num_repeats', 1)
-        if is_main_process():
-            logger.info(f'size_bucket: {size_bucket}, num_files: {len(self.metadata_dataset)}, num_repeats: {self.num_repeats}')
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         self.latent_dataset = _map_and_cache(
@@ -242,8 +240,7 @@ class DirectoryDataset:
             image_file = file
             caption_file = image_file.with_suffix('.txt')
             if not os.path.exists(caption_file):
-                if is_main_process():
-                    logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
+                logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
                 continue
             image_files.append(str(image_file))
             caption_files.append(str(caption_file))
@@ -312,8 +309,7 @@ class DirectoryDataset:
                     width, height = pil_img.size
                     frames = 1
             except Exception:
-                if is_main_process():
-                    logger.warning(f'Image file {image_file} could not be opened. Skipping.')
+                logger.warning(f'Image file {image_file} could not be opened. Skipping.')
                 return None
             log_ar = np.log(width / height)
             # Best AR bucket is the one with the smallest AR difference in log space.
@@ -391,8 +387,6 @@ class Dataset:
         self.post_init_called = True
 
         if subsample_ratio := self.dataset_config.get('subsample_ratio', None):
-            if is_main_process():
-                logger.info(f'Subsampling dataset with ratio {subsample_ratio}')
             new_len = int(len(self) * subsample_ratio)
             self.iteration_order = self.iteration_order[:new_len]
 
@@ -434,11 +428,65 @@ class Dataset:
             ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
 
+def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, caching_batch_size):
+    for ds in datasets:
+        ds.cache_metadata(regenerate_cache=regenerate_cache)
+
+    def latents_map_fn(example, indices):
+        first_size_bucket = example['size_bucket'][0]
+        tensors = []
+        te_idx = []
+        for idx, path, size_bucket in zip(indices, example['image_file'], example['size_bucket']):
+            assert size_bucket == first_size_bucket
+            items = preprocess_media_file_fn(path, size_bucket)
+            tensors.extend(items)
+            te_idx.extend([idx] * len(items))
+
+        if len(tensors) == 0:
+            # TODO: haven't tested this, maybe returning None isn't the right thing and need to return empty dict
+            return None
+
+        caching_batch_size = len(example['image_file'])
+        results = defaultdict(list)
+        for i in range(0, len(tensors), caching_batch_size):
+            batched = torch.stack(tensors[i:i+caching_batch_size])
+            parent_conn, child_conn = mp.Pipe()
+            queue.put((0, batched, child_conn))
+            result = parent_conn.recv()  # dict
+            for k, v in result.items():
+                results[k].append(v)
+        # concatenate the list of tensors at each key into one batched tensor
+        for k, v in results.items():
+            results[k] = torch.cat(v)
+        results['te_idx'] = te_idx
+        return results
+
+    for ds in datasets:
+        ds.cache_latents(latents_map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+
+    for text_encoder_idx in range(num_text_encoders):
+        def text_embedding_map_fn(example):
+            parent_conn, child_conn = mp.Pipe()
+            queue.put((text_encoder_idx+1, example['caption'], child_conn))
+            result = parent_conn.recv()  # dict
+            return result
+        for ds in datasets:
+            ds.cache_text_embeddings(text_embedding_map_fn, text_encoder_idx+1, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+
+    # signal that we're done
+    queue.put(None)
+
+
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
     def __init__(self, model, regenerate_cache=False, caching_batch_size=1):
         self.model = model
+        self.vae = self.model.get_vae()
+        self.text_encoders = self.model.get_text_encoders()
+        self.submodels = [self.vae] + list(self.text_encoders)
+        self.call_vae_fn = self.model.get_call_vae_fn(self.vae)
+        self.call_text_encoder_fns = [self.model.get_call_text_encoder_fn(text_encoder) for text_encoder in self.text_encoders]
         self.regenerate_cache = regenerate_cache
         self.caching_batch_size = caching_batch_size
         self.datasets = []
@@ -447,31 +495,71 @@ class DatasetManager:
         self.datasets.append(dataset)
 
     def cache(self):
-        with zero_first():
-            self._cache()
+        if is_main_process():
+            manager = mp.Manager()
+            queue = [manager.Queue()]
+        else:
+            queue = [None]
+        torch.distributed.broadcast_object_list(queue, src=0, group=dist.get_world_group())
+        queue = queue[0]
+
+        # start up a process to run through the dataset caching flow
+        if is_main_process():
+            process = mp.Process(
+                target=_cache_fn,
+                args=(
+                    self.datasets,
+                    queue,
+                    self.model.get_preprocess_media_file_fn(),
+                    len(self.text_encoders),
+                    self.regenerate_cache,
+                    self.caching_batch_size,
+                )
+            )
+            process.start()
+
+        # loop on the original processes (one per GPU) to handle tasks requiring GPU models (VAE, text encoders)
+        while True:
+            task = queue.get()
+            if task is None:
+                # Propagate None so all worker processes break out of this loop.
+                # This is safe because it's a FIFO queue. The first None always comes after all work items.
+                queue.put(None)
+                break
+            self._handle_task(task)
+        if is_main_process():
+            process.join()
+
+        # Now load all datasets from cache.
+        dist.barrier()
+        for ds in self.datasets:
+            ds.cache_metadata()
+            ds.cache_latents(None)
+            for i in range(1, len(self.text_encoders)+1):
+                ds.cache_text_embeddings(None, i)
 
     @torch.no_grad()
-    def _cache(self):
-        for ds in self.datasets:
-            ds.cache_metadata(regenerate_cache=self.regenerate_cache)
-
-        vae = self.model.get_vae()
-        if is_main_process():
-            vae.to('cuda')
-            logger.info('Caching latents')
-        for ds in self.datasets:
-            ds.cache_latents(self.model.get_latents_map_fn(vae), regenerate_cache=self.regenerate_cache, caching_batch_size=self.caching_batch_size)
-        vae.to('cpu')
-        empty_cuda_cache()
-
-        for i, text_encoder in enumerate(self.model.get_text_encoders()):
-            if is_main_process():
-                text_encoder.to('cuda')
-                logger.info(f'Caching text embeddings {i}')
-            for ds in self.datasets:
-                ds.cache_text_embeddings(self.model.get_text_embeddings_map_fn(text_encoder), i, regenerate_cache=self.regenerate_cache, caching_batch_size=self.caching_batch_size)
-            text_encoder.to('cpu')
-            empty_cuda_cache()
+    def _handle_task(self, task):
+        id = task[0]
+        # moved needed submodel to cuda, and everything else to cpu
+        if self.submodels[id].device.type != 'cuda':
+            for i, submodel in enumerate(self.submodels):
+                if i != id:
+                    submodel.to('cpu')
+            self.submodels[id].to('cuda')
+        if id == 0:
+            tensor, pipe = task[1], task[2]
+            results = self.call_vae_fn(tensor)
+        elif id > 0:
+            caption, pipe = task[1], task[2]
+            results = self.call_text_encoder_fns[id-1](caption)
+        else:
+            raise RuntimeError()
+        # Need to move to CPU here. If we don't, we get this error:
+        # RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use the 'spawn' start method
+        # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
+        results = {k: v.to('cpu') for k, v in results.items()}
+        pipe.send(results)
 
 
 def split_batch(batch, pieces):
