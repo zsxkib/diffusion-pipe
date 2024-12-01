@@ -92,18 +92,22 @@ class PreprocessMediaFile:
 
         is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
         if is_video:
+            num_frames = 0
+            for frame in imageio.v3.imiter(filepath, fps=FRAMERATE):
+                channels = frame.shape[-1]
+                num_frames += 1
             frames = imageio.v3.imiter(filepath, fps=FRAMERATE)
         else:
+            num_frames = 1
             frames = [imageio.v3.imread(filepath)]
+            channels = frames[0].shape[-1]
 
-        torch_frames = []
-        for frame in frames:
+        video = torch.empty((num_frames, channels, height_padded, width_padded))
+        for i, frame in enumerate(frames):
             pil_image = torchvision.transforms.functional.to_pil_image(frame)
             cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
-            torch_frames.append(self.pil_to_tensor(cropped_image))
+            video[i, ...] = self.pil_to_tensor(cropped_image)
 
-        video = torch.stack(torch_frames)
-        del torch_frames # save memory
         # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
         video = torch.permute(video, (1, 0, 2, 3))
 
