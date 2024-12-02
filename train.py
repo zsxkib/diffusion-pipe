@@ -104,7 +104,7 @@ def print_model_info(model):
 
 
 def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_steps, quantile, pbar=None):
-    eval_dataloader.dataset.set_eval_quantile(quantile)
+    eval_dataloader.set_eval_quantile(quantile)
     orig_micro_batches = model_engine.micro_batches
     model_engine.micro_batches = eval_gradient_accumulation_steps
     iterator = iter(eval_dataloader)
@@ -367,7 +367,6 @@ if __name__ == '__main__':
     model_engine.lr_scheduler = lr_scheduler
 
     train_data.post_init(
-        model,
         model_engine.grid.get_data_parallel_rank(),
         model_engine.grid.get_data_parallel_world_size(),
         model_engine.train_micro_batch_size_per_gpu(),
@@ -375,7 +374,6 @@ if __name__ == '__main__':
     )
     for eval_data in eval_data_map.values():
         eval_data.post_init(
-            model,
             model_engine.grid.get_data_parallel_rank(),
             model_engine.grid.get_data_parallel_world_size(),
             config.get('eval_batch_size', model_engine.train_micro_batch_size_per_gpu()),
@@ -387,7 +385,7 @@ if __name__ == '__main__':
     communication_data_type = config['lora']['dtype'] if 'lora' in config else config['model']['dtype']
     model_engine.communication_data_type = communication_data_type
 
-    train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine.gradient_accumulation_steps())
+    train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine.gradient_accumulation_steps(), model)
 
     step = 1
     # make sure to do this before calling model_engine.set_dataloader(), as that method creates an iterator
@@ -416,7 +414,7 @@ if __name__ == '__main__':
     model_engine.total_steps = steps_per_epoch * config['epochs']
 
     eval_dataloaders = {
-        name: dataset_util.PipelineDataLoader(eval_data, config['eval_gradient_accumulation_steps'])
+        name: dataset_util.PipelineDataLoader(eval_data, config['eval_gradient_accumulation_steps'], model)
         for name, eval_data in eval_data_map.items()
     }
 

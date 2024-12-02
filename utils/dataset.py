@@ -15,7 +15,7 @@ from PIL import Image
 import imageio
 import torch.multiprocessing as mp
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS
+from utils.common import is_main_process, VIDEO_EXTENSIONS, log_duration
 
 
 DEBUG = False
@@ -67,8 +67,9 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         batched=True,
         batch_size=caching_batch_size,
         with_indices=with_indices,
-        #num_proc=NUM_PROC,
+        num_proc=NUM_PROC,
     )
+    dataset.set_format('torch')
     return dataset
 
 
@@ -101,6 +102,9 @@ class SizeBucketDataset:
         # up by index.
         self.latent_dataset = self.latent_dataset.shuffle(seed=123)
         # TODO: should we do dataset.flatten_indices() to make it contiguous on disk again?
+        # self.latent_dataset = self.latent_dataset.flatten_indices(
+        #     cache_file_name=str(self.cache_dir / 'latents_flattened.arrow')
+        # )
 
     def add_text_embedding_dataset(self, te_dataset):
         self.text_embedding_datasets.append(te_dataset)
@@ -353,8 +357,7 @@ class Dataset:
             directory_dataset = DirectoryDataset(directory_config, dataset_config, model_name)
             self.directory_datasets.append(directory_dataset)
 
-    def post_init(self, model, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
-        self.model = model
+    def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_world_size = data_parallel_world_size
         self.batch_size = per_device_batch_size * gradient_accumulation_steps
@@ -405,8 +408,8 @@ class Dataset:
         examples_for_this_dp_rank = examples[start_idx:start_idx+self.batch_size]
         if DEBUG:
             print((start_idx, start_idx+self.batch_size))
-        batch =  self._collate(examples_for_this_dp_rank)
-        return self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
+        batch = self._collate(examples_for_this_dp_rank)
+        return batch
 
     # collates a list of dictionaries of tensors into a single dictionary of batched tensors
     def _collate(self, examples):
@@ -471,6 +474,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
     for text_encoder_idx in range(num_text_encoders):
         def text_embedding_map_fn(example):
             parent_conn, child_conn = mp.Pipe()
+            # TODO: I've seen this cause EOFError. Restarting the training script fixes it (?)
             queue.put((text_encoder_idx+1, example['caption'], child_conn))
             result = parent_conn.recv()  # dict
             return result
@@ -531,11 +535,12 @@ class DatasetManager:
                 queue.put(None)
                 break
             self._handle_task(task)
+
+        dist.barrier()
         if is_main_process():
             process.join()
 
         # Now load all datasets from cache.
-        dist.barrier()
         for ds in self.datasets:
             ds.cache_metadata()
             ds.cache_latents(None)
@@ -579,17 +584,22 @@ def split_batch(batch, pieces):
 # pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
 # Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
 class PipelineDataLoader:
-    def __init__(self, dataset, gradient_accumulation_steps):
+    def __init__(self, dataset, gradient_accumulation_steps, model):
+        self.model = model
         self.dataset = dataset
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.skip_first_n_batches = None
         self.iter_called = False
+        self.eval_quantile = None
         self.reset()
 
     def reset(self):
         self.epoch = 1
         self.num_batches_pulled = 0
         self.next_micro_batch = None
+
+    def set_eval_quantile(self, quantile):
+        self.eval_quantile = quantile
 
     def __iter__(self):
         self.iter_called = True
@@ -624,11 +634,14 @@ class PipelineDataLoader:
             pin_memory=True,
             batch_size=None,
             sampler=sampler,
+            num_workers=2,
+            persistent_workers=True,
         )
         self.data = self._pull_batches_from_dataloader()
 
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
+            batch = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
             self.num_batches_pulled += 1
             for micro_batch in split_batch(batch, self.gradient_accumulation_steps):
                 yield micro_batch
