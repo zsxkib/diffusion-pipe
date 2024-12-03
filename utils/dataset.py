@@ -13,7 +13,7 @@ import datasets
 from datasets.fingerprint import Hasher
 from PIL import Image
 import imageio
-import torch.multiprocessing as mp
+import multiprocess as mp
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, log_duration
 
@@ -88,6 +88,7 @@ class SizeBucketDataset:
         self.num_repeats = self.directory_config.get('num_repeats', 1)
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+        print(f'caching latents: {self.size_bucket}')
         self.latent_dataset = _map_and_cache(
             self.metadata_dataset,
             map_fn,
@@ -190,6 +191,7 @@ class ARBucketDataset:
         return self.size_buckets
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+        print(f'caching latents: {self.ar_frames}')
         for ds in self.size_buckets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
@@ -229,6 +231,10 @@ class DirectoryDataset:
             num_ar_buckets = self.directory_config.get('num_ar_buckets', self.dataset_config['num_ar_buckets'])
             self.ars = np.geomspace(min_ar, max_ar, num=num_ar_buckets)
         frame_buckets = self.directory_config.get('frame_buckets', self.dataset_config.get('frame_buckets', [1]))
+        if 1 not in frame_buckets:
+            # always have an image bucket for convenience
+            frame_buckets.append(1)
+        frame_buckets.sort()
         self.frame_buckets = np.array(frame_buckets)
 
     def cache_metadata(self, regenerate_cache=False):
@@ -256,7 +262,10 @@ class DirectoryDataset:
             self._metadata_map_fn(self.ars, self.frame_buckets),
             cache_file_name=str(self.cache_dir / 'metadata/metadata.arrow'),
             load_from_cache_file=(not regenerate_cache),
+            batched=True,
+            batch_size=1,
             num_proc=NUM_PROC,
+            remove_columns=metadata_dataset.column_names,
         )
         grouped_metadata = defaultdict(lambda: defaultdict(list))
         for example in metadata_dataset:
@@ -287,15 +296,19 @@ class DirectoryDataset:
     def _metadata_map_fn(self, ars, frame_buckets):
         log_ars = np.log(ars)
         def fn(example):
-            with open(example['caption_file']) as f:
+            # batch size always 1
+            caption_file = example['caption_file'][0]
+            image_file = example['image_file'][0]
+            with open(caption_file) as f:
                 caption = f.read().strip()
             if self.directory_config['shuffle_tags']:
                 tags = [tag.strip() for tag in caption.split(',')]
                 random.shuffle(tags)
                 caption = ', '.join(tags)
             caption = self.directory_config['caption_prefix'] + caption
+            empty_return = {'image_file': [], 'caption': [], 'ar_bucket': []}
 
-            image_file = Path(example['image_file'])
+            image_file = Path(image_file)
             try:
                 if image_file.suffix in VIDEO_EXTENSIONS:
                     # 100% accurate frame count, but much slower.
@@ -314,16 +327,25 @@ class DirectoryDataset:
                     frames = 1
             except Exception:
                 logger.warning(f'Image file {image_file} could not be opened. Skipping.')
-                return None
+                return empty_return
             log_ar = np.log(width / height)
             # Best AR bucket is the one with the smallest AR difference in log space.
             i = np.argmin(np.abs(log_ar - log_ars))
-            # TODO: fix this. We drop any video with frames less than the bucket. So this won't work right at all with
-            # more than one frame bucket.
-            j = np.argmin(np.abs(frames - frame_buckets))
+            # find closest frame bucket where the number of frames is greater than or equal to the bucket
+            diffs = frames - frame_buckets
+            positive_diffs = diffs[diffs >= 0]
+            if len(positive_diffs) == 0:
+                # video not long enough to find any valid frame bucket
+                print(f'video with frames={frames} is being skipped because it is too short')
+                return empty_return
+            j = np.argmin(positive_diffs)
+            if frames > 1 and frame_buckets[j] == 1:
+                # don't let video be mapped to the image frame bucket
+                print(f'video with frames={frames} is being skipped because it is too short')
+                return empty_return
             ar_bucket = (ars[i], frame_buckets[j])
 
-            return {'caption': caption, 'ar_bucket': ar_bucket}
+            return {'image_file': [str(image_file)], 'caption': [caption], 'ar_bucket': [ar_bucket]}
         return fn
 
     def get_size_bucket_datasets(self):
@@ -333,6 +355,7 @@ class DirectoryDataset:
         return result
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
+        print(f'caching latents: {self.path}')
         for ds in self.ar_buckets:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
@@ -435,7 +458,11 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
     # Dataset map() starts a bunch of processes. Make sure torch uses a limited number of threads
     # to avoid CPU contention.
     # TODO: if we ever change Datasets map to use spawn instead of fork, this might not work.
-    torch.set_num_threads(os.cpu_count() // NUM_PROC)
+    #torch.set_num_threads(os.cpu_count() // NUM_PROC)
+    # HF Datasets map can randomly hang if this is greater than one (???)
+    # See https://github.com/pytorch/pytorch/issues/10996
+    # Alternatively, we could try fixing this by using spawn instead of fork.
+    torch.set_num_threads(1)
 
     for ds in datasets:
         ds.cache_metadata(regenerate_cache=regenerate_cache)
@@ -457,7 +484,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         results = defaultdict(list)
         for i in range(0, len(tensors), caching_batch_size):
             batched = torch.stack(tensors[i:i+caching_batch_size])
-            parent_conn, child_conn = mp.Pipe()
+            parent_conn, child_conn = mp.Pipe(duplex=False)
             queue.put((0, batched, child_conn))
             result = parent_conn.recv()  # dict
             for k, v in result.items():
@@ -473,8 +500,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 
     for text_encoder_idx in range(num_text_encoders):
         def text_embedding_map_fn(example):
-            parent_conn, child_conn = mp.Pipe()
-            # TODO: I've seen this cause EOFError. Restarting the training script fixes it (?)
+            parent_conn, child_conn = mp.Pipe(duplex=False)
             queue.put((text_encoder_idx+1, example['caption'], child_conn))
             result = parent_conn.recv()  # dict
             return result
@@ -502,6 +528,14 @@ class DatasetManager:
     def register(self, dataset):
         self.datasets.append(dataset)
 
+    # Some notes for myself:
+    # Use a manager queue, since that can be pickled and unpickled, and sent to other processes.
+    # IMPORTANT: we use multiprocess library (not Python multiprocessing!) just like HF Datasets does.
+    # After hours of debugging and looking up related issues, I have concluded multiprocessing is outright bugged
+    # for this use case. Something about making a manager queue and sending it to the caching process, and then
+    # further sending it to map() workers via the pickled map function, is broken. It gets through a lot of the caching,
+    # but eventually, inevitably, queue.put() will fail with BrokenPipeError. Switching from multiprocessing to multiprocess,
+    # which has basically the same API, and everything works perfectly. ¯\_(ツ)_/¯
     def cache(self):
         if is_main_process():
             manager = mp.Manager()

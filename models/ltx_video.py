@@ -54,7 +54,7 @@ def load_scheduler(scheduler_dir):
     return RectifiedFlowScheduler.from_config(scheduler_config)
 
 
-def extract_clips(video, target_frames, config):
+def extract_clips(video, target_frames, video_clip_mode):
     # video is (channels, num_frames, height, width)
     frames = video.shape[1]
     if frames < target_frames:
@@ -62,7 +62,6 @@ def extract_clips(video, target_frames, config):
         print(f'video with shape {video.shape} is being skipped because it has less than the target_frames')
         return []
 
-    video_clip_mode = config.get('video_clip_mode', 'single_middle')
     if video_clip_mode == 'single_beginning':
         return [video[:, :target_frames, ...]]
     elif video_clip_mode == 'single_middle':
@@ -82,6 +81,8 @@ def extract_clips(video, target_frames, config):
 class PreprocessMediaFile:
     def __init__(self, config):
         self.config = config
+        self.video_clip_mode = config.get('video_clip_mode', 'single_middle')
+        print(f'using video_clip_mode={self.video_clip_mode}')
         self.pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
     def __call__(self, filepath, size_bucket):
@@ -111,7 +112,7 @@ class PreprocessMediaFile:
         # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
         video = torch.permute(video, (1, 0, 2, 3))
 
-        return extract_clips(video, frames_padded, self.config)
+        return extract_clips(video, frames_padded, self.video_clip_mode)
 
 
 class LTXVideoPipeline(BasePipeline):

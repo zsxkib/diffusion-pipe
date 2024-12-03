@@ -7,7 +7,6 @@ import time
 import random
 import json
 import inspect
-import torch.multiprocessing as mp
 
 import toml
 import deepspeed
@@ -17,6 +16,7 @@ import torch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import multiprocess as mp
 
 from utils import dataset as dataset_util
 from utils.common import is_main_process, get_rank, DTYPE_MAP
@@ -165,13 +165,12 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
 
 
 if __name__ == '__main__':
-    # workaround for https://github.com/pytorch/pytorch/issues/10996
-    mp.set_start_method('spawn')
     # needed for broadcasting Queue in dataset.py
     mp.current_process().authkey = b'afsaskgfdjh4'
 
     with open(args.config) as f:
-        config = toml.load(f)
+        # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
+        config = json.loads(json.dumps(toml.load(f)))
     with open(args.deepspeed_config) as f:
         ds_config = json.load(f)
 
