@@ -1,10 +1,86 @@
 from pathlib import Path
 
 import peft
+import torch
 from torch import nn
 import safetensors.torch
+import torchvision
+from PIL import ImageOps
+from torchvision import transforms
+import imageio
 
-from utils.common import is_main_process
+from utils.common import is_main_process, VIDEO_EXTENSIONS
+
+
+def extract_clips(video, target_frames, video_clip_mode):
+    # video is (channels, num_frames, height, width)
+    frames = video.shape[1]
+    if frames < target_frames:
+        # TODO: think about how to handle this case. Maybe the video should have already been thrown out?
+        print(f'video with shape {video.shape} is being skipped because it has less than the target_frames')
+        return []
+
+    if video_clip_mode == 'single_beginning':
+        return [video[:, :target_frames, ...]]
+    elif video_clip_mode == 'single_middle':
+        start = int((frames - target_frames) / 2)
+        assert frames-start >= target_frames
+        return [video[:, start:start+target_frames, ...]]
+    elif video_clip_mode == 'multiple_overlapping':
+        # Extract multiple clips so we use the whole video for training.
+        # The clips might overlap a little bit. We never cut anything off the end of the video.
+        num_clips = ((frames - 1) // target_frames) + 1
+        start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
+        return [video[:, i:i+target_frames, ...] for i in start_indices]
+    else:
+        raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
+
+
+class PreprocessMediaFile:
+    def __init__(self, config, support_video=False, framerate=None):
+        self.config = config
+        self.video_clip_mode = config.get('video_clip_mode', 'single_middle')
+        print(f'using video_clip_mode={self.video_clip_mode}')
+        self.pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+        self.support_video = support_video
+        self.framerate = framerate
+        if self.support_video:
+            assert self.framerate
+
+    def __call__(self, filepath, size_bucket):
+        width, height, frames = size_bucket
+        height_padded = ((height - 1) // 32 + 1) * 32
+        width_padded = ((width - 1) // 32 + 1) * 32
+        frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
+
+        is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
+        if is_video:
+            assert self.support_video
+            num_frames = 0
+            for frame in imageio.v3.imiter(filepath, fps=self.framerate):
+                channels = frame.shape[-1]
+                num_frames += 1
+            frames = imageio.v3.imiter(filepath, fps=self.framerate)
+        else:
+            num_frames = 1
+            frames = [imageio.v3.imread(filepath)]
+            channels = frames[0].shape[-1]
+
+        video = torch.empty((num_frames, channels, height_padded, width_padded))
+        for i, frame in enumerate(frames):
+            pil_image = torchvision.transforms.functional.to_pil_image(frame)
+            cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
+            video[i, ...] = self.pil_to_tensor(cropped_image)
+
+        if not self.support_video:
+            return [video.squeeze(0)]
+
+        # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
+        video = torch.permute(video, (1, 0, 2, 3))
+        if not is_video:
+            return [video]
+        else:
+            return extract_clips(video, frames_padded, self.video_clip_mode)
 
 
 class BasePipeline:

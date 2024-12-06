@@ -19,10 +19,10 @@ from tqdm import tqdm
 import multiprocess as mp
 
 from utils import dataset as dataset_util
+from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP
 import utils.saver
 from utils.isolate_rng import isolate_rng
-from models import flux, ltx_video
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -175,6 +175,7 @@ if __name__ == '__main__':
         ds_config = json.load(f)
 
     set_config_defaults(config)
+    common.AUTOCAST_DTYPE = config['model']['dtype']
 
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
@@ -192,9 +193,14 @@ if __name__ == '__main__':
     model_type = config['model']['type']
 
     if model_type == 'flux':
+        from models import flux
         model = flux.FluxPipeline(config)
     elif model_type == 'ltx-video':
+        from models import ltx_video
         model = ltx_video.LTXVideoPipeline(config)
+    elif model_type == 'hunyuan-video':
+        from models import hunyuan_video
+        model = hunyuan_video.HunyuanVideoPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 

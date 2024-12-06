@@ -6,16 +6,11 @@ sys.path.insert(0, os.path.abspath('submodules/LTX-Video'))
 
 from transformers import T5EncoderModel, T5Tokenizer
 import safetensors
-import imageio
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torchvision
-from PIL import ImageOps
-from torchvision import transforms
 
-from models.base import BasePipeline
-from utils.common import VIDEO_EXTENSIONS
+from models.base import BasePipeline, PreprocessMediaFile
 from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
 from ltx_video.models.autoencoders.causal_video_autoencoder import CausalVideoAutoencoder
 from ltx_video.models.transformers.transformer3d import Transformer3DModel
@@ -52,67 +47,6 @@ def load_scheduler(scheduler_dir):
     scheduler_config_path = scheduler_dir / 'scheduler_config.json'
     scheduler_config = RectifiedFlowScheduler.load_config(scheduler_config_path)
     return RectifiedFlowScheduler.from_config(scheduler_config)
-
-
-def extract_clips(video, target_frames, video_clip_mode):
-    # video is (channels, num_frames, height, width)
-    frames = video.shape[1]
-    if frames < target_frames:
-        # TODO: think about how to handle this case. Maybe the video should have already been thrown out?
-        print(f'video with shape {video.shape} is being skipped because it has less than the target_frames')
-        return []
-
-    if video_clip_mode == 'single_beginning':
-        return [video[:, :target_frames, ...]]
-    elif video_clip_mode == 'single_middle':
-        start = int((frames - target_frames) / 2)
-        assert frames-start >= target_frames
-        return [video[:, start:start+target_frames, ...]]
-    elif video_clip_mode == 'multiple_overlapping':
-        # Extract multiple clips so we use the whole video for training.
-        # The clips might overlap a little bit. We never cut anything off the end of the video.
-        num_clips = ((frames - 1) // target_frames) + 1
-        start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
-        return [video[:, i:i+target_frames, ...] for i in start_indices]
-    else:
-        raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
-
-
-class PreprocessMediaFile:
-    def __init__(self, config):
-        self.config = config
-        self.video_clip_mode = config.get('video_clip_mode', 'single_middle')
-        print(f'using video_clip_mode={self.video_clip_mode}')
-        self.pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-
-    def __call__(self, filepath, size_bucket):
-        width, height, frames = size_bucket
-        height_padded = ((height - 1) // 32 + 1) * 32
-        width_padded = ((width - 1) // 32 + 1) * 32
-        frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
-
-        is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
-        if is_video:
-            num_frames = 0
-            for frame in imageio.v3.imiter(filepath, fps=FRAMERATE):
-                channels = frame.shape[-1]
-                num_frames += 1
-            frames = imageio.v3.imiter(filepath, fps=FRAMERATE)
-        else:
-            num_frames = 1
-            frames = [imageio.v3.imread(filepath)]
-            channels = frames[0].shape[-1]
-
-        video = torch.empty((num_frames, channels, height_padded, width_padded))
-        for i, frame in enumerate(frames):
-            pil_image = torchvision.transforms.functional.to_pil_image(frame)
-            cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
-            video[i, ...] = self.pil_to_tensor(cropped_image)
-
-        # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
-        video = torch.permute(video, (1, 0, 2, 3))
-
-        return extract_clips(video, frames_padded, self.video_clip_mode)
 
 
 class LTXVideoPipeline(BasePipeline):
@@ -167,7 +101,7 @@ class LTXVideoPipeline(BasePipeline):
         raise NotImplementedError()
 
     def get_preprocess_media_file_fn(self):
-        return PreprocessMediaFile(self.config)
+        return PreprocessMediaFile(self.config, support_video=True, framerate=FRAMERATE)
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
@@ -175,7 +109,8 @@ class LTXVideoPipeline(BasePipeline):
         return fn
 
     def get_call_text_encoder_fn(self, text_encoder):
-        def fn(caption):
+        def fn(caption, is_video):
+            # args are lists
             (
                 prompt_embeds,
                 prompt_attention_mask,

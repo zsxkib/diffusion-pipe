@@ -1,3 +1,6 @@
 [submodule "submodules/LTX-Video"]
 	path = submodules/LTX-Video
 	url = https://github.com/Lightricks/LTX-Video
+[submodule "submodules/HunyuanVideo"]
+	path = submodules/HunyuanVideo
+	url = https://github.com/Tencent/HunyuanVideo

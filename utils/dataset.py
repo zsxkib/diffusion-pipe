@@ -196,6 +196,7 @@ class ARBucketDataset:
             ds.cache_latents(map_fn, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
+        print(f'caching text embeddings: {self.ar_frames}')
         te_dataset = _map_and_cache(
             self.metadata_dataset,
             map_fn,
@@ -306,7 +307,7 @@ class DirectoryDataset:
                 random.shuffle(tags)
                 caption = ', '.join(tags)
             caption = self.directory_config['caption_prefix'] + caption
-            empty_return = {'image_file': [], 'caption': [], 'ar_bucket': []}
+            empty_return = {'image_file': [], 'caption': [], 'ar_bucket': [], 'is_video': []}
 
             image_file = Path(image_file)
             try:
@@ -328,6 +329,7 @@ class DirectoryDataset:
             except Exception:
                 logger.warning(f'Image file {image_file} could not be opened. Skipping.')
                 return empty_return
+            is_video = (frames > 1)
             log_ar = np.log(width / height)
             # Best AR bucket is the one with the smallest AR difference in log space.
             i = np.argmin(np.abs(log_ar - log_ars))
@@ -339,13 +341,13 @@ class DirectoryDataset:
                 print(f'video with frames={frames} is being skipped because it is too short')
                 return empty_return
             j = np.argmin(positive_diffs)
-            if frames > 1 and frame_buckets[j] == 1:
+            if is_video and frame_buckets[j] == 1:
                 # don't let video be mapped to the image frame bucket
                 print(f'video with frames={frames} is being skipped because it is too short')
                 return empty_return
             ar_bucket = (ars[i], frame_buckets[j])
 
-            return {'image_file': [str(image_file)], 'caption': [caption], 'ar_bucket': [ar_bucket]}
+            return {'image_file': [str(image_file)], 'caption': [caption], 'ar_bucket': [ar_bucket], 'is_video': [is_video]}
         return fn
 
     def get_size_bucket_datasets(self):
@@ -501,7 +503,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
     for text_encoder_idx in range(num_text_encoders):
         def text_embedding_map_fn(example):
             parent_conn, child_conn = mp.Pipe(duplex=False)
-            queue.put((text_encoder_idx+1, example['caption'], child_conn))
+            queue.put((text_encoder_idx+1, example['caption'], example['is_video'], child_conn))
             result = parent_conn.recv()  # dict
             return result
         for ds in datasets:
@@ -570,6 +572,11 @@ class DatasetManager:
                 break
             self._handle_task(task)
 
+        # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
+        # TODO: check if this is actually freeing memory.
+        for model in self.submodels:
+            model.to('meta')
+
         dist.barrier()
         if is_main_process():
             process.join()
@@ -585,17 +592,17 @@ class DatasetManager:
     def _handle_task(self, task):
         id = task[0]
         # moved needed submodel to cuda, and everything else to cpu
-        if self.submodels[id].device.type != 'cuda':
+        if next(self.submodels[id].parameters()).device.type != 'cuda':
             for i, submodel in enumerate(self.submodels):
                 if i != id:
                     submodel.to('cpu')
             self.submodels[id].to('cuda')
         if id == 0:
-            tensor, pipe = task[1], task[2]
+            tensor, pipe = task[1:]
             results = self.call_vae_fn(tensor)
         elif id > 0:
-            caption, pipe = task[1], task[2]
-            results = self.call_text_encoder_fns[id-1](caption)
+            caption, is_video, pipe = task[1:]
+            results = self.call_text_encoder_fns[id-1](caption, is_video=is_video)
         else:
             raise RuntimeError()
         # Need to move to CPU here. If we don't, we get this error:
