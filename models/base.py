@@ -5,7 +5,7 @@ import torch
 from torch import nn
 import safetensors.torch
 import torchvision
-from PIL import ImageOps
+from PIL import Image, ImageOps
 from torchvision import transforms
 import imageio
 
@@ -36,6 +36,21 @@ def extract_clips(video, target_frames, video_clip_mode):
         raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
 
 
+def convert_crop_and_resize(pil_img, width_and_height):
+    if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
+        pil_img = pil_img.convert('RGBA')
+
+    # add white background for transparent images
+    if pil_img.mode == 'RGBA':
+        canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
+        canvas.alpha_composite(pil_img)
+        pil_img = canvas.convert('RGB')
+    else:
+        pil_img = pil_img.convert('RGB')
+
+    return ImageOps.fit(pil_img, width_and_height)
+
+
 class PreprocessMediaFile:
     def __init__(self, config, support_video=False, framerate=None):
         self.config = config
@@ -49,6 +64,7 @@ class PreprocessMediaFile:
 
     def __call__(self, filepath, size_bucket):
         width, height, frames = size_bucket
+        # TODO: fix for Hunyuan Video
         height_padded = ((height - 1) // 32 + 1) * 32
         width_padded = ((width - 1) // 32 + 1) * 32
         frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
@@ -58,18 +74,18 @@ class PreprocessMediaFile:
             assert self.support_video
             num_frames = 0
             for frame in imageio.v3.imiter(filepath, fps=self.framerate):
-                channels = frame.shape[-1]
                 num_frames += 1
             frames = imageio.v3.imiter(filepath, fps=self.framerate)
         else:
             num_frames = 1
-            frames = [imageio.v3.imread(filepath)]
-            channels = frames[0].shape[-1]
+            pil_img = Image.open(filepath)
+            frames = [pil_img]
 
-        video = torch.empty((num_frames, channels, height_padded, width_padded))
+        video = torch.empty((num_frames, 3, height_padded, width_padded))
         for i, frame in enumerate(frames):
-            pil_image = torchvision.transforms.functional.to_pil_image(frame)
-            cropped_image = ImageOps.fit(pil_image, (width_padded, height_padded))
+            if not isinstance(frame, Image.Image):
+                frame = torchvision.transforms.functional.to_pil_image(frame)
+            cropped_image = convert_crop_and_resize(frame, (width_padded, height_padded))
             video[i, ...] = self.pil_to_tensor(cropped_image)
 
         if not self.support_video:
@@ -84,6 +100,9 @@ class PreprocessMediaFile:
 
 
 class BasePipeline:
+    def load_diffusion_model(self):
+        pass
+
     def get_vae(self):
         raise NotImplementedError()
 

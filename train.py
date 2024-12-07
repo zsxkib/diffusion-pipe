@@ -64,6 +64,8 @@ def set_config_defaults(config):
     model_config = config['model']
     model_dtype_str = model_config['dtype']
     model_config['dtype'] = DTYPE_MAP[model_dtype_str]
+    if 'transformer_dtype' in model_config:
+        model_config['transformer_dtype'] = DTYPE_MAP[model_config['transformer_dtype']]
     model_config.setdefault('guidance', 1.0)
 
     if 'adapter' in config:
@@ -168,6 +170,11 @@ if __name__ == '__main__':
     # needed for broadcasting Queue in dataset.py
     mp.current_process().authkey = b'afsaskgfdjh4'
 
+    # try to fix "OSError: [Errno 24] Too many open files" that can happen when running eval
+    # https://github.com/pytorch/pytorch/issues/11201
+    import torch.multiprocessing
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
     with open(args.config) as f:
         # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
         config = json.loads(json.dumps(toml.load(f)))
@@ -237,6 +244,8 @@ if __name__ == '__main__':
     dataset_manager.cache()
     if args.cache_only:
         quit()
+
+    model.load_diffusion_model()
 
     if adapter_config := config.get('adapter', None):
         peft_config = model.configure_adapter(adapter_config)

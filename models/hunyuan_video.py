@@ -136,92 +136,98 @@ class HunyuanVideoPipeline(BasePipeline):
         args.model_base = self.model_config['diffusers_path']
         args.dit_weight = os.path.join(args.model_base, 'hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt')
 
-        args = sanity_check_args(args)
-
-        factor_kwargs = {"device": 'cpu', "dtype": dtype}
-        in_channels = args.latent_channels
-        out_channels = args.latent_channels
-        with init_empty_weights():
-            transformer = load_model(
-                args,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                factor_kwargs=factor_kwargs,
-            )
-        transformer = load_state_dict(args, transformer, args.model_base, dtype)
+        self.args = sanity_check_args(args)
 
         vae, _, s_ratio, t_ratio = load_vae(
-            args.vae,
+            self.args.vae,
             TYPE_TO_PRECISION[dtype],
-            vae_path=os.path.join(args.model_base, 'hunyuan-video-t2v-720p/vae'),
+            vae_path=os.path.join(self.args.model_base, 'hunyuan-video-t2v-720p/vae'),
             logger=logger,
             device='cpu',
         )
         vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
         # Enabled by default in inference scripts, so we should probably train with it.
-        vae.enable_tiling()
+        #vae.enable_tiling()
 
         # Text encoder
-        if args.prompt_template_video is not None:
-            crop_start = PROMPT_TEMPLATE[args.prompt_template_video].get(
+        if self.args.prompt_template_video is not None:
+            crop_start = PROMPT_TEMPLATE[self.args.prompt_template_video].get(
                 "crop_start", 0
             )
-            self.max_text_length_video = args.text_len + crop_start
-        if args.prompt_template is not None:
-            crop_start = PROMPT_TEMPLATE[args.prompt_template].get("crop_start", 0)
-            self.max_text_length_image = args.text_len + crop_start
+            self.max_text_length_video = self.args.text_len + crop_start
+        if self.args.prompt_template is not None:
+            crop_start = PROMPT_TEMPLATE[self.args.prompt_template].get("crop_start", 0)
+            self.max_text_length_image = self.args.text_len + crop_start
 
         prompt_template = (
-            PROMPT_TEMPLATE[args.prompt_template]
-            if args.prompt_template is not None
+            PROMPT_TEMPLATE[self.args.prompt_template]
+            if self.args.prompt_template is not None
             else None
         )
 
         prompt_template_video = (
-            PROMPT_TEMPLATE[args.prompt_template_video]
-            if args.prompt_template_video is not None
+            PROMPT_TEMPLATE[self.args.prompt_template_video]
+            if self.args.prompt_template_video is not None
             else None
         )
 
         text_encoder = TextEncoder(
-            text_encoder_type=args.text_encoder,
+            text_encoder_type=self.args.text_encoder,
             max_length=self.max_text_length_video,
-            text_encoder_path=os.path.join(args.model_base, 'text_encoder'),
+            text_encoder_path=os.path.join(self.args.model_base, 'text_encoder'),
             text_encoder_precision=TYPE_TO_PRECISION[dtype],
-            tokenizer_type=args.tokenizer,
+            tokenizer_type=self.args.tokenizer,
             prompt_template=prompt_template,
             prompt_template_video=prompt_template_video,
-            hidden_state_skip_layer=args.hidden_state_skip_layer,
-            apply_final_norm=args.apply_final_norm,
-            reproduce=args.reproduce,
+            hidden_state_skip_layer=self.args.hidden_state_skip_layer,
+            apply_final_norm=self.args.apply_final_norm,
+            reproduce=self.args.reproduce,
             logger=logger,
             device='cpu',
         )
 
         text_encoder_2 = TextEncoder(
-            text_encoder_type=args.text_encoder_2,
-            max_length=args.text_len_2,
-            text_encoder_path=os.path.join(args.model_base, 'text_encoder_2'),
+            text_encoder_type=self.args.text_encoder_2,
+            max_length=self.args.text_len_2,
+            text_encoder_path=os.path.join(self.args.model_base, 'text_encoder_2'),
             text_encoder_precision=TYPE_TO_PRECISION[dtype],
-            tokenizer_type=args.tokenizer_2,
-            reproduce=args.reproduce,
+            tokenizer_type=self.args.tokenizer_2,
+            reproduce=self.args.reproduce,
             logger=logger,
             device='cpu',
         )
 
         self.inference_pipeline = HunyuanVideoSampler(
-            args=args,
+            args=self.args,
             vae=vae,
             vae_kwargs=vae_kwargs,
             text_encoder=text_encoder,
             text_encoder_2=text_encoder_2,
-            model=transformer,
+            model=None,
             use_cpu_offload=False,
             device='cpu',
             logger=logger,
         )
         self.diffusers_pipeline = self.inference_pipeline.pipeline
 
+    # delay loading transformer to save RAM
+    def load_diffusion_model(self):
+        transformer_dtype = self.model_config.get('transformer_dtype', self.model_config['dtype'])
+        # Device needs to be cuda here or we get an error. We initialize the model with empty weights so it doesn't matter, and
+        # then directly load the weights onto CPU right after.
+        factor_kwargs = {"device": 'cuda', "dtype": transformer_dtype}
+        in_channels = self.args.latent_channels
+        out_channels = self.args.latent_channels
+        with init_empty_weights():
+            transformer = load_model(
+                self.args,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                factor_kwargs=factor_kwargs,
+            )
+        transformer = load_state_dict(self.args, transformer, self.args.model_base, transformer_dtype)
+        self.inference_pipeline.model = transformer
+        self.diffusers_pipeline.transformer = transformer
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
         # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
@@ -240,7 +246,9 @@ class HunyuanVideoPipeline(BasePipeline):
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
         # Convention is to have "transformer." prefix
-        peft_state_dict = {'transformer.'+k: v for k, v in peft_state_dict.items()}
+        #peft_state_dict = {'transformer.'+k: v for k, v in peft_state_dict.items()}
+        # TODO: using raw PEFT key format for now, for easier testing.
+        peft_state_dict = {'base_model.model.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, diffusers_sd):
@@ -439,12 +447,15 @@ class InitialLayer(nn.Module):
                 f"Unsupported text_projection: {self.text_projection}"
             )
 
-        # Everything passed between layers needs to be a CUDA tensor for Deepspeed pipeline parallelism.
-        txt_seq_len = torch.tensor(txt.shape[1], device=img.device)
-        img_seq_len = torch.tensor(img.shape[1], device=img.device)
+        txt_seq_len = txt.shape[1]
+        img_seq_len = img.shape[1]
 
         # Compute cu_squlens and max_seqlen for flash attention
         cu_seqlens = get_cu_seqlens(text_mask, img_seq_len)
+
+        # Everything passed between layers needs to be a CUDA tensor for Deepspeed pipeline parallelism.
+        txt_seq_len = torch.tensor(txt_seq_len, device=img.device)
+        img_seq_len = torch.tensor(img_seq_len, device=img.device)
         max_seqlen = img_seq_len + txt_seq_len
 
         return img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target

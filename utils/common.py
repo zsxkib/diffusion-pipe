@@ -7,7 +7,7 @@ import deepspeed.comm.comm as dist
 import imageio
 
 
-DTYPE_MAP = {'float32': torch.float32, 'float16': torch.float16, 'bfloat16': torch.bfloat16}
+DTYPE_MAP = {'float32': torch.float32, 'float16': torch.float16, 'bfloat16': torch.bfloat16, 'float8': torch.float8_e4m3fn}
 VIDEO_EXTENSIONS = set(x.extension for x in imageio.config.video_extensions)
 AUTOCAST_DTYPE = None
 
