@@ -23,6 +23,7 @@ from utils import common
 from utils.common import is_main_process, get_rank, DTYPE_MAP
 import utils.saver
 from utils.isolate_rng import isolate_rng
+from utils.patches import apply_patches
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -167,6 +168,8 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
 
 
 if __name__ == '__main__':
+    apply_patches()
+
     # needed for broadcasting Queue in dataset.py
     mp.current_process().authkey = b'afsaskgfdjh4'
 
