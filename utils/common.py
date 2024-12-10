@@ -5,6 +5,7 @@ import time
 import torch
 import deepspeed.comm.comm as dist
 import imageio
+from safetensors import safe_open
 
 
 DTYPE_MAP = {'float32': torch.float32, 'float16': torch.float16, 'bfloat16': torch.bfloat16, 'float8': torch.float8_e4m3fn}
@@ -41,3 +42,11 @@ def log_duration(name):
         yield
     finally:
         print(f'{name}: {time.time()-start:.3f}')
+
+
+def load_safetensors(path):
+    tensors = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            tensors[key] = f.get_tensor(key)
+    return tensors

@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import argparse
+import json
 import os.path
 sys.path.insert(0, os.path.abspath('submodules/HunyuanVideo'))
 
@@ -13,14 +14,17 @@ from accelerate.utils import set_module_tensor_to_device
 from loguru import logger
 
 from models.base import BasePipeline, PreprocessMediaFile
-from utils.common import AUTOCAST_DTYPE
+from utils.common import AUTOCAST_DTYPE, load_safetensors
 from hyvideo.config import add_network_args, add_extra_models_args, add_denoise_schedule_args, add_inference_args, sanity_check_args
 from hyvideo.modules import load_model
 from hyvideo.vae import load_vae
 from hyvideo.constants import PRECISION_TO_TYPE, PROMPT_TEMPLATE
 from hyvideo.text_encoder import TextEncoder
-from hyvideo.inference import HunyuanVideoSampler
 from hyvideo.modules.attenion import get_cu_seqlens
+from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
+from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
+from hyvideo.diffusion.pipelines import HunyuanVideoPipeline as OriginalHunyuanVideoPipeline
+from hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 
 
 FRAMERATE = 24
@@ -28,7 +32,56 @@ FRAMERATE = 24
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
 
 
-def load_state_dict(args, model, pretrained_model_path, dtype):
+def get_rotary_pos_embed(transformer, video_length, height, width):
+    target_ndim = 3
+    ndim = 5 - 2
+    rope_theta = 256
+    patch_size = transformer.patch_size
+    rope_dim_list = transformer.rope_dim_list
+    hidden_size = transformer.hidden_size
+    heads_num = transformer.heads_num
+    head_dim = hidden_size // heads_num
+
+    # 884
+    latents_size = [(video_length - 1) // 4 + 1, height // 8, width // 8]
+
+    if isinstance(patch_size, int):
+        assert all(s % patch_size == 0 for s in latents_size), (
+            f"Latent size(last {ndim} dimensions) should be divisible by patch size({patch_size}), "
+            f"but got {latents_size}."
+        )
+        rope_sizes = [s // patch_size for s in latents_size]
+    elif isinstance(patch_size, list):
+        assert all(
+            s % patch_size[idx] == 0
+            for idx, s in enumerate(latents_size)
+        ), (
+            f"Latent size(last {ndim} dimensions) should be divisible by patch size({patch_size}), "
+            f"but got {latents_size}."
+        )
+        rope_sizes = [
+            s // patch_size[idx] for idx, s in enumerate(latents_size)
+        ]
+
+    if len(rope_sizes) != target_ndim:
+        rope_sizes = [1] * (target_ndim - len(rope_sizes)) + rope_sizes  # time axis
+
+    if rope_dim_list is None:
+        rope_dim_list = [head_dim // target_ndim for _ in range(target_ndim)]
+    assert (
+        sum(rope_dim_list) == head_dim
+    ), "sum(rope_dim_list) should equal to head_dim of attention layer"
+    freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
+        rope_dim_list,
+        rope_sizes,
+        theta=rope_theta,
+        use_real=True,
+        theta_rescale_factor=1,
+    )
+    return freqs_cos, freqs_sin
+
+
+def load_state_dict(args, pretrained_model_path):
     load_key = args.load_key
     dit_weight = Path(args.dit_weight)
 
@@ -102,12 +155,7 @@ def load_state_dict(args, model, pretrained_model_path, dtype):
                 f"are: {list(state_dict.keys())}."
             )
 
-    base_dtype = torch.bfloat16
-    params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
-    for name, param in model.named_parameters():
-        dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
-        set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
-    return model
+    return state_dict
 
 
 def vae_encode(tensor, vae):
@@ -133,23 +181,11 @@ class HunyuanVideoPipeline(BasePipeline):
         parser = add_denoise_schedule_args(parser)
         parser = add_inference_args(parser)
         args = parser.parse_args([])
-        args.model_base = self.model_config['diffusers_path']
-        args.dit_weight = os.path.join(args.model_base, 'hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt')
-
+        if 'ckpt_path' in self.model_config:
+            args.model_base = self.model_config['ckpt_path']
+            args.dit_weight = os.path.join(args.model_base, 'hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt')
         self.args = sanity_check_args(args)
 
-        vae, _, s_ratio, t_ratio = load_vae(
-            self.args.vae,
-            TYPE_TO_PRECISION[dtype],
-            vae_path=os.path.join(self.args.model_base, 'hunyuan-video-t2v-720p/vae'),
-            logger=logger,
-            device='cpu',
-        )
-        vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
-        # Enabled by default in inference scripts, so we should probably train with it.
-        #vae.enable_tiling()
-
-        # Text encoder
         if self.args.prompt_template_video is not None:
             crop_start = PROMPT_TEMPLATE[self.args.prompt_template_video].get(
                 "crop_start", 0
@@ -159,6 +195,28 @@ class HunyuanVideoPipeline(BasePipeline):
             crop_start = PROMPT_TEMPLATE[self.args.prompt_template].get("crop_start", 0)
             self.max_text_length_image = self.args.text_len + crop_start
 
+        if vae_path := self.model_config.get('vae_path', None):
+            with open('configs/hy_vae_config.json') as f:
+                vae_config = json.load(f)
+            vae_sd = load_safetensors(vae_path)
+            vae = AutoencoderKLCausal3D.from_config(vae_config)
+            vae.load_state_dict(vae_sd)
+            del vae_sd
+            vae.requires_grad_(False)
+            vae.eval()
+            vae.to(dtype=dtype)
+        else:
+            vae, _, _, _ = load_vae(
+                self.args.vae,
+                TYPE_TO_PRECISION[dtype],
+                vae_path=os.path.join(self.args.model_base, 'hunyuan-video-t2v-720p/vae'),
+                logger=logger,
+                device='cpu',
+            )
+        # Enabled by default in inference scripts, so we should probably train with it.
+        vae.enable_tiling()
+
+        # Text encoder
         prompt_template = (
             PROMPT_TEMPLATE[self.args.prompt_template]
             if self.args.prompt_template is not None
@@ -171,10 +229,11 @@ class HunyuanVideoPipeline(BasePipeline):
             else None
         )
 
+        llm_path = self.model_config.get('llm_path', os.path.join(self.args.model_base, 'text_encoder'))
         text_encoder = TextEncoder(
             text_encoder_type=self.args.text_encoder,
             max_length=self.max_text_length_video,
-            text_encoder_path=os.path.join(self.args.model_base, 'text_encoder'),
+            text_encoder_path=llm_path,
             text_encoder_precision=TYPE_TO_PRECISION[dtype],
             tokenizer_type=self.args.tokenizer,
             prompt_template=prompt_template,
@@ -186,10 +245,11 @@ class HunyuanVideoPipeline(BasePipeline):
             device='cpu',
         )
 
+        clip_path = self.model_config.get('clip_path', os.path.join(self.args.model_base, 'text_encoder_2'))
         text_encoder_2 = TextEncoder(
             text_encoder_type=self.args.text_encoder_2,
             max_length=self.args.text_len_2,
-            text_encoder_path=os.path.join(self.args.model_base, 'text_encoder_2'),
+            text_encoder_path=clip_path,
             text_encoder_precision=TYPE_TO_PRECISION[dtype],
             tokenizer_type=self.args.tokenizer_2,
             reproduce=self.args.reproduce,
@@ -197,18 +257,20 @@ class HunyuanVideoPipeline(BasePipeline):
             device='cpu',
         )
 
-        self.inference_pipeline = HunyuanVideoSampler(
-            args=self.args,
+        scheduler = FlowMatchDiscreteScheduler(
+            shift=7.0,
+            reverse=True,
+            solver="euler",
+        )
+
+        self.diffusers_pipeline = OriginalHunyuanVideoPipeline(
+            transformer=None,
             vae=vae,
-            vae_kwargs=vae_kwargs,
             text_encoder=text_encoder,
             text_encoder_2=text_encoder_2,
-            model=None,
-            use_cpu_offload=False,
-            device='cpu',
-            logger=logger,
+            scheduler=scheduler,
+            args=args,
         )
-        self.diffusers_pipeline = self.inference_pipeline.pipeline
 
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
@@ -225,8 +287,16 @@ class HunyuanVideoPipeline(BasePipeline):
                 out_channels=out_channels,
                 factor_kwargs=factor_kwargs,
             )
-        transformer = load_state_dict(self.args, transformer, self.args.model_base, transformer_dtype)
-        self.inference_pipeline.model = transformer
+        if transformer_path := self.model_config.get('transformer_path', None):
+            state_dict = load_safetensors(transformer_path)
+        else:
+            state_dict = load_state_dict(self.args, self.args.model_base)
+        params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
+        base_dtype = self.model_config['dtype']
+        for name, param in transformer.named_parameters():
+            dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else transformer_dtype
+            set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+
         self.diffusers_pipeline.transformer = transformer
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
@@ -355,8 +425,8 @@ class HunyuanVideoPipeline(BasePipeline):
         video_length = (num_frames - 1) * 4 + 1
         video_height = h * 8
         video_width = w * 8
-        freqs_cos, freqs_sin = self.inference_pipeline.get_rotary_pos_embed(
-            video_length, video_height, video_width
+        freqs_cos, freqs_sin = get_rotary_pos_embed(
+            self.transformer, video_length, video_height, video_width
         )
         freqs_cos = freqs_cos.expand(bs, -1, -1)
         freqs_sin = freqs_sin.expand(bs, -1, -1)
