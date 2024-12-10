@@ -253,7 +253,14 @@ class HunyuanVideoPipeline(BasePipeline):
         raise NotImplementedError()
 
     def get_preprocess_media_file_fn(self):
-        return PreprocessMediaFile(self.config, support_video=True, framerate=FRAMERATE)
+        return PreprocessMediaFile(
+            self.config,
+            support_video=True,
+            framerate=FRAMERATE,
+            round_height=8,
+            round_width=8,
+            round_frames=4,
+        )
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):

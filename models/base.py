@@ -52,22 +52,24 @@ def convert_crop_and_resize(pil_img, width_and_height):
 
 
 class PreprocessMediaFile:
-    def __init__(self, config, support_video=False, framerate=None):
+    def __init__(self, config, support_video=False, framerate=None, round_height=1, round_width=1, round_frames=1):
         self.config = config
         self.video_clip_mode = config.get('video_clip_mode', 'single_middle')
         print(f'using video_clip_mode={self.video_clip_mode}')
         self.pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
         self.support_video = support_video
         self.framerate = framerate
+        self.round_height = round_height
+        self.round_width = round_width
+        self.round_frames = round_frames
         if self.support_video:
             assert self.framerate
 
     def __call__(self, filepath, size_bucket):
         width, height, frames = size_bucket
-        # TODO: fix for Hunyuan Video
-        height_padded = ((height - 1) // 32 + 1) * 32
-        width_padded = ((width - 1) // 32 + 1) * 32
-        frames_padded = ((frames - 2) // 8 + 1) * 8 + 1
+        height_padded = ((height - 1) // self.round_height + 1) * self.round_height
+        width_padded = ((width - 1) // self.round_width + 1) * self.round_width
+        frames_padded = ((frames - 2) // self.round_frames + 1) * self.round_frames + 1
 
         is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
         if is_video:
