@@ -184,6 +184,9 @@ if __name__ == '__main__':
     set_config_defaults(config)
     common.AUTOCAST_DTYPE = config['model']['dtype']
 
+    if config['model']['type'] == 'hunyuan-video' and config['pipeline_stages'] > 1:
+        raise NotImplementedError('There is currently a bug with Deepspeed pipeline parallelism and Hunyuan Video. You must use pipeline_stages = 1.')
+
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
         else config.get('resume_from_checkpoint', False)
