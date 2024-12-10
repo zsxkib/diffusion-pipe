@@ -162,10 +162,13 @@ class BasePipeline:
     def save_model(self, save_dir, diffusers_sd):
         raise NotImplementedError()
 
-    def get_latents_map_fn(self, vae, size_bucket):
+    def get_preprocess_media_file_fn(self):
+        return PreprocessMediaFile(self.config, support_video=False)
+
+    def get_call_vae_fn(self, vae):
         raise NotImplementedError()
 
-    def get_text_embeddings_map_fn(self, text_encoder):
+    def get_call_text_encoder_fn(self, text_encoder):
         raise NotImplementedError()
 
     def prepare_inputs(self, inputs, timestep_quantile=None):

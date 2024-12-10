@@ -1,19 +1,16 @@
 import math
 
 import diffusers
-import peft
 import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
-from torchvision import transforms
-from PIL import Image, ImageOps
 from deepspeed.utils.logging import logger
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from utils.common import is_main_process
 from models.base import BasePipeline
+from utils.common import AUTOCAST_DTYPE
 
 NUM_DOUBLE_BLOCKS = 19
 NUM_SINGLE_BLOCKS = 38
@@ -97,62 +94,6 @@ def make_diffusers_to_bfl_map(num_double_blocks: int = NUM_DOUBLE_BLOCKS, num_si
     return diffusers_to_bfl_map
 
 
-def crop_and_resize(pil_img, size_bucket):
-    if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
-        pil_img = pil_img.convert('RGBA')
-
-    # add white background for transparent images
-    if pil_img.mode == 'RGBA':
-        canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
-        canvas.alpha_composite(pil_img)
-        pil_img = canvas.convert('RGB')
-    else:
-        pil_img = pil_img.convert('RGB')
-
-    return ImageOps.fit(pil_img, size_bucket)
-
-
-pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-def encode_pil_to_latents(pil_imgs, vae):
-    img = torch.stack([pil_to_tensor(pil_img) for pil_img in pil_imgs])
-    latents = vae.encode(img.to(vae.device, vae.dtype)).latent_dist.sample()
-    if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
-        latents = latents - vae.config.shift_factor
-    latents = latents * vae.config.scaling_factor
-    latents = latents.to('cpu')
-    return latents
-
-
-tensor_to_pil = transforms.Compose([transforms.Lambda(lambda x: (x / 2 + 0.5).clamp(0, 1)), transforms.ToPILImage()])
-def decode_latents_to_pil(latents, vae):
-    latents = latents.to(vae.device)
-    latents = latents / vae.config.scaling_factor
-    if hasattr(vae.config, 'shift_factor'):
-        latents = latents + vae.config.shift_factor
-    img = vae.decode(latents.to(vae.dtype), return_dict=False)[0].to(torch.float32)
-    img = img.squeeze(0)
-    return tensor_to_pil(img)
-
-
-def process_image_fn(vae, size_bucket):
-    width_height = size_bucket[:2]
-    def fn(example, indices):
-        pil_imgs = []
-        for image_file in example['image_file']:
-            try:
-                pil_img = Image.open(image_file)
-            except Exception:
-                logger.warning(f'Image file {image_file} could not be opened. Skipping.')
-                return None
-            pil_img = crop_and_resize(pil_img, width_height)
-            pil_imgs.append(pil_img)
-
-        latents = encode_pil_to_latents(pil_imgs, vae)
-        return {'latents': latents, 'te_idx': indices}
-
-    return fn
-
-
 def is_dev(safetensors_path):
     with safe_open(safetensors_path, framework='pt', device='cpu') as f:
         for key in f.keys():
@@ -186,6 +127,8 @@ class FluxPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
+        if 'transformer_dtype' in self.model_config:
+            raise NotImplementedError('Flux does not currently support transformer_dtype (e.g. float8)')
         kwargs = {}
         if transformer_path := self.model_config.get('transformer', None):
             transformer_config = 'configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
@@ -254,21 +197,30 @@ class FluxPipeline(BasePipeline):
 
         save_file(flux_sd, save_dir / 'model.safetensors', metadata={"format": "pt"})
 
-    # TODO: update this to work with latest changes
-    def get_latents_map_fn(self, vae, size_bucket):
-        return process_image_fn(vae, size_bucket)
+    def get_call_vae_fn(self, vae):
+        def fn(tensor):
+            latents = vae.encode(tensor.to(vae.device, vae.dtype)).latent_dist.sample()
+            if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
+                latents = latents - vae.config.shift_factor
+            latents = latents * vae.config.scaling_factor
+            return {'latents': latents}
+        return fn
 
-    def get_text_embeddings_map_fn(self, text_encoder):
+    def get_call_text_encoder_fn(self, text_encoder):
         if text_encoder == self.text_encoder:
-            def fn(example):
-                return {'clip_embed': self._get_clip_prompt_embeds(prompt=example['caption'], device=text_encoder.device).to('cpu')}
+            def fn(caption, is_video):
+                # args are lists
+                assert not any(is_video)
+                return {'clip_embed': self._get_clip_prompt_embeds(prompt=caption, device=text_encoder.device)}
             return fn
         elif text_encoder == self.text_encoder_2:
-            def fn(example):
-                return {'t5_embed': self._get_t5_prompt_embeds(prompt=example['caption'], device=text_encoder.device).to('cpu')}
+            def fn(caption, is_video):
+                # args are lists
+                assert not any(is_video)
+                return {'t5_embed': self._get_t5_prompt_embeds(prompt=caption, device=text_encoder.device)}
             return fn
         else:
-            raise RuntimeError(f'Text encoder {text_encoder.__class__} does not have a map fn implemented')
+            raise RuntimeError(f'Text encoder {text_encoder.__class__} does not have a function to call it')
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents']
@@ -307,8 +259,7 @@ class FluxPipeline(BasePipeline):
         target = x_0 - x_1
         guidance_vec = torch.full((x_t.shape[0],), float(self.model_config['guidance']), device=x_t.device, dtype=torch.float32)
 
-        model_dtype = self.model_config['dtype']
-        features = (x_t.to(model_dtype), t5_embed.to(model_dtype), clip_embed.to(model_dtype), t, img_ids, txt_ids, guidance_vec, target)
+        features = (x_t, t5_embed, clip_embed, t, img_ids, txt_ids, guidance_vec, target)
 
         # We pass the target through the layers of the model in the features tuple, so that it matches the noisy input when we get to the
         # last pipeline parallel stage.
@@ -334,6 +285,7 @@ class EmbeddingWrapper(nn.Module):
         self.context_embedder = context_embedder
         self.pos_embed = pos_embed
 
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         # Don't know why I have to do this. I had to do it in qlora-pipe also.
         # Without it, you get RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
@@ -363,6 +315,7 @@ class TransformerWrapper(nn.Module):
         super().__init__()
         self.block = block
 
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target = inputs
         encoder_hidden_states, hidden_states = self.block(
@@ -385,6 +338,7 @@ class SingleTransformerWrapper(nn.Module):
         super().__init__()
         self.block = block
 
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target = inputs
         hidden_states = self.block(
@@ -401,6 +355,7 @@ class OutputWrapper(nn.Module):
         self.norm_out = norm_out
         self.proj_out = proj_out
 
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target = inputs
         hidden_states = hidden_states[:, encoder_hidden_states.shape[1] :, ...]
