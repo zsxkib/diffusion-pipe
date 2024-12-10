@@ -251,8 +251,8 @@ class DirectoryDataset:
             image_file = file
             caption_file = image_file.with_suffix('.txt')
             if not os.path.exists(caption_file):
-                logger.warning(f'Image file {image_file} does not have corresponding caption file. Skipping.')
-                continue
+                logger.warning(f'Image file {image_file} does not have corresponding caption file.')
+                caption_file = ''
             image_files.append(str(image_file))
             caption_files.append(str(caption_file))
         metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
@@ -300,8 +300,11 @@ class DirectoryDataset:
             # batch size always 1
             caption_file = example['caption_file'][0]
             image_file = example['image_file'][0]
-            with open(caption_file) as f:
-                caption = f.read().strip()
+            if not caption_file:
+                caption = ''
+            else:
+                with open(caption_file) as f:
+                    caption = f.read().strip()
             if self.directory_config['shuffle_tags']:
                 tags = [tag.strip() for tag in caption.split(',')]
                 random.shuffle(tags)
