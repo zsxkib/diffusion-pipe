@@ -404,7 +404,7 @@ if __name__ == '__main__':
         eval_data.post_init(
             model_engine.grid.get_data_parallel_rank(),
             model_engine.grid.get_data_parallel_world_size(),
-            config.get('eval_batch_size', model_engine.train_micro_batch_size_per_gpu()),
+            config.get('eval_micro_batch_size_per_gpu', model_engine.train_micro_batch_size_per_gpu()),
             config['eval_gradient_accumulation_steps'],
         )
 
