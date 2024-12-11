@@ -39,6 +39,8 @@ conda create -n diffusion-pipe python=3.12
 conda activate diffusion-pipe
 ```
 
+Install nvcc: https://anaconda.org/nvidia/cuda-nvcc. Probably try to make it match the CUDA version that was installed on your system with PyTorch.
+
 Install the dependencies:
 ```
 pip install -r requirements.txt

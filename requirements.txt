@@ -18,3 +18,5 @@ imageio[ffmpeg]
 av
 einops
 accelerate
+loguru
+flash-attn
