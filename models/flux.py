@@ -130,7 +130,7 @@ class FluxPipeline(BasePipeline):
         if 'transformer_dtype' in self.model_config:
             raise NotImplementedError('Flux does not currently support transformer_dtype (e.g. float8)')
         kwargs = {}
-        if transformer_path := self.model_config.get('transformer', None):
+        if transformer_path := self.model_config.get('transformer_path', None):
             transformer_config = 'configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
             transformer = diffusers.FluxTransformer2DModel.from_single_file(
                 self.model_config['transformer'],
