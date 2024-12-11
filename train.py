@@ -185,8 +185,6 @@ if __name__ == '__main__':
     with open(args.config) as f:
         # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
         config = json.loads(json.dumps(toml.load(f)))
-    with open(args.deepspeed_config) as f:
-        ds_config = json.load(f)
 
     set_config_defaults(config)
     common.AUTOCAST_DTYPE = config['model']['dtype']
@@ -232,6 +230,12 @@ if __name__ == '__main__':
 
     with open(config['dataset']) as f:
         dataset_config = toml.load(f)
+    ds_config = {
+        'train_micro_batch_size_per_gpu': config.get('micro_batch_size_per_gpu', 1),
+        'gradient_accumulation_steps': config.get('gradient_accumulation_steps', 1),
+        'gradient_clipping': config.get('gradient_clipping', 1.0),
+        'steps_per_print': config.get('steps_per_print', 1),
+    }
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
@@ -269,7 +273,6 @@ if __name__ == '__main__':
         run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
         os.makedirs(run_dir, exist_ok=True)
         shutil.copy(args.config, run_dir)
-        shutil.copy(args.deepspeed_config, run_dir)
     # wait for all processes then get the most recent dir (may have just been created)
     dist.barrier()
     run_dir = get_most_recent_run_dir(config['output_dir'])
@@ -381,6 +384,7 @@ if __name__ == '__main__':
         model=pipeline_model,
         model_parameters=parameters_to_train,
         optimizer=get_optimizer,
+        config=ds_config,
     )
 
     lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)

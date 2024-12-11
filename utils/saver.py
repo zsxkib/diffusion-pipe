@@ -82,7 +82,6 @@ class Saver:
                 state_dict.update(torch.load(path, weights_only=True, map_location='cpu'))
             self.model.save_adapter(save_dir, state_dict)
             shutil.copy(self.args.config, save_dir)
-            shutil.copy(self.args.deepspeed_config, save_dir)
             shutil.rmtree(tmp_dir)
 
     def save_full_model(self, name, max_shard_size='5GB'):
@@ -106,7 +105,6 @@ class Saver:
                 state_dict.update(torch.load(path, map_location='cpu'))
             self.model.save_model(save_dir, state_dict)
             shutil.copy(self.args.config, save_dir)
-            shutil.copy(self.args.deepspeed_config, save_dir)
             shutil.rmtree(tmp_dir)
 
     def save_model(self, name):
