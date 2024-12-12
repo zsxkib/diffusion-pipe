@@ -152,7 +152,10 @@ class BasePipeline:
         modified_state_dict = {}
         model_parameters = set(name for name, p in self.transformer.named_parameters())
         for k, v in adapter_state_dict.items():
+            # Diffusers prefix
             k = k.replace('transformer.', '')
+            # HunyuanVideo ComfyUI prefix
+            k = k.replace('diffusion_model.', '')
             k = k.replace('weight', 'default.weight')
             if k not in model_parameters:
                 raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
