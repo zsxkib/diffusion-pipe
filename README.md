@@ -3,7 +3,7 @@ A pipeline parallel training script for diffusion models.
 
 Currently supports Flux, LTX-Video, and HunyuanVideo.
 
-**Work in progress and highly experimental.** It is unstable and not well tested. Things might not work right. I haven't tested it on Windows, as I use Linux exclusively for all my ML dev work.
+**Work in progress and highly experimental.** It is unstable and not well tested. Things might not work right.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -17,6 +17,10 @@ Currently supports Flux, LTX-Video, and HunyuanVideo.
 - Training state checkpointing and resuming from checkpoint
 - Efficient multi-process, multi-GPU pre-caching of latents and text embeddings
 - Easily add support for new models by implementing a single subclass
+
+
+## Windows support
+There are reports that it doesn't work on Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). However, at least one user was able to get it running and training successfully on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommending trying WSL 2.
 
 
 ## Installing
