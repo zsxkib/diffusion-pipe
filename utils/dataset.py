@@ -259,9 +259,12 @@ class DirectoryDataset:
         # Shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
         # Processes other than rank 0 will then load it from cache.
         metadata_dataset = metadata_dataset.shuffle(seed=0)
+        metadata_map_fn = self._metadata_map_fn(self.ars, self.frame_buckets)
+        fingerprint = Hasher.hash([metadata_dataset._fingerprint, metadata_map_fn])
+        print('caching metadata')
         metadata_dataset = metadata_dataset.map(
-            self._metadata_map_fn(self.ars, self.frame_buckets),
-            cache_file_name=str(self.cache_dir / 'metadata/metadata.arrow'),
+            metadata_map_fn,
+            cache_file_name=str(self.cache_dir / f'metadata/metadata_{fingerprint}.arrow'),
             load_from_cache_file=(not regenerate_cache),
             batched=True,
             batch_size=1,
