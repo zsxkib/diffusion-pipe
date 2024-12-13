@@ -7,7 +7,6 @@ Currently supports Flux, LTX-Video, and HunyuanVideo.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
-    - There's currently a bug that prevents pipeline parallelism from working with HunyuanVideo
 - Full fine tune support for:
     - Flux
 - LoRA support for:
@@ -70,7 +69,7 @@ Flux doesn't currently support training a LoRA on a fp8 base model (if you want 
 ### HunyuanVideo
 HunyuanVideo supports fp8 transformer. The example config file will train a HunyuanVideo LoRA, on images only, in well under 24GB of VRAM. You can probably bump the resolution to 1024x1024 or higher.
 
-Video uses A LOT more memory. I was able to train a rank 32 LoRA on 512x512x33 sized videos in just under 23GB VRAM usage. When pipeline parallelism is fixed for Hunyuan, that will help a bit if you have multiple GPUs, since the model weights will be further divided among them (but it doesn't help with the huge activation memory use of videos). Long term I want to eventually implement ring attention and/or Deepspeed Ulysses for parallelizing the sequence dimension across GPUs, which should greatly help for training on videos.
+Video uses A LOT more memory. I was able to train a rank 32 LoRA on 512x512x33 sized videos in just under 23GB VRAM usage. Pipeline parallelism will help a bit if you have multiple GPUs, since the model weights will be further divided among them (but it doesn't help with the huge activation memory use of videos). Long term I want to eventually implement ring attention and/or Deepspeed Ulysses for parallelizing the sequence dimension across GPUs, which should greatly help for training on videos.
 
 ### LTX-Video
 I've barely done any training on LTX-Video. The model is much lighter than Hunyuan, and the latent space more compressed, so it uses less memory. You can train loras even on video at a reasonable length (I forgot exactly what it was) on 24GB.

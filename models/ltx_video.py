@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.base import BasePipeline, PreprocessMediaFile
+from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from ltx_video.models.transformers.symmetric_patchifier import SymmetricPatchifier
 from ltx_video.models.autoencoders.causal_video_autoencoder import CausalVideoAutoencoder
 from ltx_video.models.transformers.transformer3d import Transformer3DModel
@@ -253,8 +253,7 @@ class InitialLayer(nn.Module):
                 batch_size, -1, hidden_states.shape[-1]
             )
 
-        ret = hidden_states, freqs_cos, freqs_sin, encoder_hidden_states, encoder_attention_mask, timestep, embedded_timestep, target
-        return ret
+        return make_contiguous(hidden_states, freqs_cos, freqs_sin, encoder_hidden_states, encoder_attention_mask, timestep, embedded_timestep, target)
 
 
 class TransformerLayer(nn.Module):
@@ -271,7 +270,7 @@ class TransformerLayer(nn.Module):
             encoder_attention_mask=encoder_attention_mask,
             timestep=timestep,
         )
-        return hidden_states, freqs_cos, freqs_sin, encoder_hidden_states, encoder_attention_mask, timestep, embedded_timestep, target
+        return make_contiguous(hidden_states, freqs_cos, freqs_sin, encoder_hidden_states, encoder_attention_mask, timestep, embedded_timestep, target)
 
 
 class OutputLayer(nn.Module):

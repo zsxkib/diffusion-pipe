@@ -12,6 +12,10 @@ import imageio
 from utils.common import is_main_process, VIDEO_EXTENSIONS
 
 
+def make_contiguous(*tensors):
+    return tuple(x.contiguous() for x in tensors)
+
+
 def extract_clips(video, target_frames, video_clip_mode):
     # video is (channels, num_frames, height, width)
     frames = video.shape[1]

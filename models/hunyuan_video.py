@@ -13,7 +13,7 @@ from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 from loguru import logger
 
-from models.base import BasePipeline, PreprocessMediaFile
+from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE, load_safetensors
 from hyvideo.config import add_network_args, add_extra_models_args, add_denoise_schedule_args, add_inference_args, sanity_check_args
 from hyvideo.modules import load_model
@@ -536,7 +536,7 @@ class InitialLayer(nn.Module):
         img_seq_len = torch.tensor(img_seq_len, device=img.device)
         max_seqlen = img_seq_len + txt_seq_len
 
-        return img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target
+        return make_contiguous(img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target)
 
 
 class DoubleBlock(nn.Module):
@@ -548,7 +548,7 @@ class DoubleBlock(nn.Module):
     def forward(self, inputs):
         img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target = inputs
         img, txt = self.block(img, txt, vec, cu_seqlens, cu_seqlens, max_seqlen.item(), max_seqlen.item(), (freqs_cos, freqs_sin))
-        return img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target
+        return make_contiguous(img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target)
 
 
 def concatenate_hidden_states(inputs):
@@ -566,7 +566,7 @@ class SingleBlock(nn.Module):
     def forward(self, inputs):
         x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target = inputs
         x = self.block(x, vec, txt_seq_len.item(), cu_seqlens, cu_seqlens, max_seqlen.item(), max_seqlen.item(), (freqs_cos, freqs_sin))
-        return x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target
+        return make_contiguous(x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args, target)
 
 class OutputLayer(nn.Module):
     def __init__(self, transformer):

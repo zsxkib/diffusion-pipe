@@ -9,7 +9,7 @@ from deepspeed.utils.logging import logger
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from models.base import BasePipeline
+from models.base import BasePipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE
 
 NUM_DOUBLE_BLOCKS = 19
@@ -307,7 +307,7 @@ class EmbeddingWrapper(nn.Module):
             img_ids = img_ids[0]
         ids = torch.cat((txt_ids, img_ids), dim=0)
         freqs_cos, freqs_sin = self.pos_embed(ids)
-        return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target)
 
 
 class TransformerWrapper(nn.Module):
@@ -324,7 +324,7 @@ class TransformerWrapper(nn.Module):
             temb=temb,
             image_rotary_emb=(freqs_cos, freqs_sin),
         )
-        return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target)
 
 
 def concatenate_hidden_states(inputs):
@@ -346,7 +346,7 @@ class SingleTransformerWrapper(nn.Module):
             temb=temb,
             image_rotary_emb=(freqs_cos, freqs_sin),
         )
-        return hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin, target)
 
 
 class OutputWrapper(nn.Module):
