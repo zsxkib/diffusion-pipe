@@ -416,6 +416,9 @@ class HunyuanVideoPipeline(BasePipeline):
             t = t * sigmoid_scale
             t = torch.sigmoid(t)
 
+        if shift := self.model_config.get('shift', None):
+            t = (t * shift) / (1 + (shift - 1) * t)
+
         x_1 = latents
         x_0 = torch.randn_like(x_1)
         t_expanded = t.view(-1, 1, 1, 1, 1)
