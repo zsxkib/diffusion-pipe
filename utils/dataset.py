@@ -255,6 +255,8 @@ class DirectoryDataset:
                 caption_file = ''
             image_files.append(str(image_file))
             caption_files.append(str(caption_file))
+        assert len(image_files) > 0, f'Directory {self.path} had no images/videos!'
+
         metadata_dataset = datasets.Dataset.from_dict({'image_file': image_files, 'caption_file': caption_files})
         # Shuffle the data. Use a fixed seed, so the dataset is identical on all processes.
         # Processes other than rank 0 will then load it from cache.
