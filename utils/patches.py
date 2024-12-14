@@ -1,9 +1,16 @@
 from typing import Optional
+import sys
+import os.path
+sys.path.insert(0, os.path.abspath('submodules/HunyuanVideo'))
 
 import torch
 from torch import nn
 import peft
 from peft.tuners._buffer_dict import BufferDict
+from transformers import CLIPTextModel, AutoModel
+
+import hyvideo.text_encoder
+from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
 
 
 def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
@@ -44,7 +51,51 @@ def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optio
             adapter_layer[adapter_name] = adapter_layer[adapter_name].to(device)
 
 
+def load_text_encoder(
+    text_encoder_type,
+    text_encoder_precision=None,
+    text_encoder_path=None,
+    logger=None,
+    device=None,
+):
+    if text_encoder_path is None:
+        text_encoder_path = TEXT_ENCODER_PATH[text_encoder_type]
+    if logger is not None:
+        logger.info(
+            f"Loading text encoder model ({text_encoder_type}) from: {text_encoder_path}"
+        )
+
+    torch_dtype = 'auto'
+    if text_encoder_precision is not None:
+        torch_dtype = PRECISION_TO_TYPE[text_encoder_precision]
+
+    if text_encoder_type == "clipL":
+        text_encoder = CLIPTextModel.from_pretrained(text_encoder_path, torch_dtype=torch_dtype)
+        text_encoder.final_layer_norm = text_encoder.text_model.final_layer_norm
+    elif text_encoder_type == "llm":
+        text_encoder = AutoModel.from_pretrained(
+            text_encoder_path, low_cpu_mem_usage=True, torch_dtype=torch_dtype
+        )
+        text_encoder.final_layer_norm = text_encoder.norm
+    else:
+        raise ValueError(f"Unsupported text encoder type: {text_encoder_type}")
+    # from_pretrained will ensure that the model is in eval mode.
+
+    text_encoder.requires_grad_(False)
+
+    if logger is not None:
+        logger.info(f"Text encoder to dtype: {text_encoder.dtype}")
+
+    if device is not None:
+        text_encoder = text_encoder.to(device)
+
+    return text_encoder, text_encoder_path
+
+
 def apply_patches():
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
     peft.tuners.tuners_utils.BaseTunerLayer._move_adapter_to_device_of_base_layer = _move_adapter_to_device_of_base_layer
+
+    # Use torch_dtype to avoid needlessly loading the text encoder in float32, only to cast it right after.
+    hyvideo.text_encoder.load_text_encoder = load_text_encoder
