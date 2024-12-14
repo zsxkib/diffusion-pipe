@@ -85,7 +85,7 @@ This caching also means that training LoRAs for text encoders is not currently s
 Two flags are relevant for caching. ```--cache_only``` does the caching flow, then exits without training anything. ```--regenerate_cache``` forces cache regeneration. If you edit the dataset in-place (like changing a caption), you need to force regenerate the cache (or delete the cache dir) for the changes to be picked up.
 
 ## HunyuanVideo LoRAs
-HunyuanVideo doesn't have an official Diffusers integration yet, and as such it doesn't have an official LoRA format. This script currently outputs the LoRA in a format that directly works with ComfyUI. Make sure the HunyuanVideoWrapper extension is fully updated, and use the "HunyuanVideo Lora Select" node.
+HunyuanVideo doesn't have an official Diffusers integration yet, and as such it doesn't have an official LoRA format. This script outputs the LoRA using the typical Diffusers convention, i.e. the state_dict keys are all prefixed with "transformer.". This will work with the latest version of the ComfyUI HunyuanVideoWrapper extension, and is likely to work with Diffusers whenever HunyuanVideo is officially integrated. Make sure the HunyuanVideoWrapper extension is fully updated, and use the "HunyuanVideo Lora Select" node.
 
 ## Extra
 You can check out my [qlora-pipe](https://github.com/tdrussell/qlora-pipe) project, which is basically the same thing as this but for LLMs.

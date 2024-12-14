@@ -315,8 +315,8 @@ class HunyuanVideoPipeline(BasePipeline):
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
-        # ComfyUI format.
-        peft_state_dict = {'diffusion_model.'+k: v for k, v in peft_state_dict.items()}
+        # Diffusers LoRA convention.
+        peft_state_dict = {'transformer.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, diffusers_sd):
