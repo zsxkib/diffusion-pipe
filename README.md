@@ -62,6 +62,9 @@ RTX 4000 series needs those 2 environment variables set. Other GPUs may not need
 
 If you enabled checkpointing, you can resume training from the latest checkpoint by simply re-running the exact same command but with the ```--resume_from_checkpoint``` flag.
 
+## Output files
+A new directory will be created in ```output_dir``` for each training run. This contains the checkpoints, saved models, and Tensorboard metrics. Saved models/LoRAs will be in directories named like epoch1, epoch2, etc. Deepspeed checkpoints are in directories named like global_step1234. The saved model directory will have the safetensor weights, Diffusers LoRA config json, as well as the diffusion-pipe config file for easier tracking of training run settings.
+
 ## VRAM requirements
 ### Flux
 Flux doesn't currently support training a LoRA on a fp8 base model (if you want this, PRs are welcome :) ). So you need to use a >24GB GPU, or use pipeline_stages=2 or higher with multiple 24GB cards. With four 24GB GPUs, you can even full finetune Flux with the right techniques (see the train.py code about gradient release and the custom AdamW8bitKahan optimizer).
