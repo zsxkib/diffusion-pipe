@@ -158,6 +158,29 @@ def load_state_dict(args, pretrained_model_path):
     return state_dict
 
 
+def _convert_state_dict_keys(model_state_dict, loaded_state_dict):
+    if next(iter(loaded_state_dict.keys())).startswith('model.model.'):
+        # ComfyUI state_dict format.
+        # Construct the key mapping the same way ComfyUI does, then invert it at the very end.
+        sd = {}
+        for k in list(model_state_dict.keys()):
+            key_out = k
+            key_out = key_out.replace("txt_in.t_embedder.mlp.0.", "txt_in.t_embedder.in_layer.").replace("txt_in.t_embedder.mlp.2.", "txt_in.t_embedder.out_layer.")
+            key_out = key_out.replace("txt_in.c_embedder.linear_1.", "txt_in.c_embedder.in_layer.").replace("txt_in.c_embedder.linear_2.", "txt_in.c_embedder.out_layer.")
+            key_out = key_out.replace("_mod.linear.", "_mod.lin.").replace("_attn_qkv.", "_attn.qkv.")
+            key_out = key_out.replace("mlp.fc1.", "mlp.0.").replace("mlp.fc2.", "mlp.2.")
+            key_out = key_out.replace("_attn_q_norm.weight", "_attn.norm.query_norm.scale").replace("_attn_k_norm.weight", "_attn.norm.key_norm.scale")
+            key_out = key_out.replace(".q_norm.weight", ".norm.query_norm.scale").replace(".k_norm.weight", ".norm.key_norm.scale")
+            key_out = key_out.replace("_attn_proj.", "_attn.proj.")
+            key_out = key_out.replace(".modulation.linear.", ".modulation.lin.")
+            key_out = key_out.replace("_in.mlp.2.", "_in.out_layer.").replace("_in.mlp.0.", "_in.in_layer.")
+            key_out = 'model.model.' + key_out
+            sd[k] = loaded_state_dict[key_out]
+        return sd
+    else:
+        return loaded_state_dict
+
+
 def vae_encode(tensor, vae):
     # tensor values already in range [-1, 1] here
     latents = vae.encode(tensor).latent_dist.sample()
@@ -289,6 +312,7 @@ class HunyuanVideoPipeline(BasePipeline):
             )
         if transformer_path := self.model_config.get('transformer_path', None):
             state_dict = load_safetensors(transformer_path)
+            state_dict = _convert_state_dict_keys(transformer.state_dict(), state_dict)
         else:
             state_dict = load_state_dict(self.args, self.args.model_base)
         params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
