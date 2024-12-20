@@ -177,11 +177,6 @@ if __name__ == '__main__':
     # needed for broadcasting Queue in dataset.py
     mp.current_process().authkey = b'afsaskgfdjh4'
 
-    # try to fix "OSError: [Errno 24] Too many open files" that can happen when running eval
-    # https://github.com/pytorch/pytorch/issues/11201
-    import torch.multiprocessing
-    torch.multiprocessing.set_sharing_strategy('file_system')
-
     with open(args.config) as f:
         # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
         config = json.loads(json.dumps(toml.load(f)))

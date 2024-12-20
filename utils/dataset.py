@@ -640,19 +640,23 @@ class PipelineDataLoader:
         self.skip_first_n_batches = None
         self.iter_called = False
         self.eval_quantile = None
-        self.reset()
+        self.epoch = 1
+        self.num_batches_pulled = 0
+        self.next_micro_batch = None
+        # Be careful to only create the DataLoader some bounded number of times: https://github.com/pytorch/pytorch/issues/91252
+        self._create_dataloader()
 
     def reset(self):
         self.epoch = 1
         self.num_batches_pulled = 0
         self.next_micro_batch = None
+        self.data = self._pull_batches_from_dataloader()
 
     def set_eval_quantile(self, quantile):
         self.eval_quantile = quantile
 
     def __iter__(self):
         self.iter_called = True
-        self._create_dataloader()
         return self
 
     def __len__(self):
@@ -666,7 +670,7 @@ class PipelineDataLoader:
             self.next_micro_batch = next(self.data)
         except StopIteration:
             assert self.skip_first_n_batches is None
-            self._create_dataloader()
+            self.data = self._pull_batches_from_dataloader()
             self.num_batches_pulled = 0
             self.next_micro_batch = next(self.data)
             self.epoch += 1
@@ -720,6 +724,7 @@ class PipelineDataLoader:
         # pulled than the actual number of batches iterated by the caller.
         self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
         self.skip_first_n_batches = self.num_batches_pulled
+        self._create_dataloader()
 
 
 class SkipFirstNSampler(torch.utils.data.Sampler):
