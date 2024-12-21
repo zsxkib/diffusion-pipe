@@ -633,10 +633,11 @@ def split_batch(batch, pieces):
 # pipeline parallel training. Iterates indefinitely (deepspeed requirement). Keeps track of epoch.
 # Updates epoch as soon as the final batch is returned (notably different from qlora-pipe).
 class PipelineDataLoader:
-    def __init__(self, dataset, gradient_accumulation_steps, model):
+    def __init__(self, dataset, gradient_accumulation_steps, model, num_dataloader_workers=2):
         self.model = model
         self.dataset = dataset
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_dataloader_workers = num_dataloader_workers
         self.skip_first_n_batches = None
         self.iter_called = False
         self.eval_quantile = None
@@ -687,8 +688,8 @@ class PipelineDataLoader:
             pin_memory=True,
             batch_size=None,
             sampler=sampler,
-            num_workers=2,
-            persistent_workers=True,
+            num_workers=self.num_dataloader_workers,
+            persistent_workers=(self.num_dataloader_workers > 0),
         )
         self.data = self._pull_batches_from_dataloader()
 

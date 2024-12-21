@@ -17,6 +17,7 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import multiprocess as mp
+import numpy as np
 
 from utils import dataset as dataset_util
 from utils import common
@@ -168,6 +169,7 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         seed = get_rank()
         random.seed(seed)
         torch.manual_seed(seed)
+        np.random.seed(seed)
         _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
 
 
@@ -434,7 +436,9 @@ if __name__ == '__main__':
     model_engine.total_steps = steps_per_epoch * config['epochs']
 
     eval_dataloaders = {
-        name: dataset_util.PipelineDataLoader(eval_data, config['eval_gradient_accumulation_steps'], model)
+        # Set num_dataloader_workers=0 so dataset iteration is completely deterministic.
+        # We want the exact same noise for each image, each time, for a stable validation loss.
+        name: dataset_util.PipelineDataLoader(eval_data, config['eval_gradient_accumulation_steps'], model, num_dataloader_workers=0)
         for name, eval_data in eval_data_map.items()
     }
 
