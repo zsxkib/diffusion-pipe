@@ -46,7 +46,7 @@ def process_caption_fn(shuffle_tags=False, caption_prefix=''):
 
 
 def round_to_multiple(x, multiple):
-    return int((x // multiple) * multiple)
+    return int(round(x / multiple) * multiple)
 
 
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, with_indices=False):
@@ -217,7 +217,9 @@ class DirectoryDataset:
         self.dataset_config = dataset_config
         self.model_name = model_name
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
-        self.resolutions = directory_config.get('resolutions', dataset_config['resolutions'])
+        self.resolutions = self._process_user_provided_resolutions(
+            directory_config.get('resolutions', dataset_config['resolutions'])
+        )
         self.path = Path(self.directory_config['path'])
         self.cache_dir = self.path / 'cache' / self.model_name
 
@@ -226,6 +228,8 @@ class DirectoryDataset:
 
         if not self.enable_ar_bucket:
             self.ars = np.array([1.0])
+        elif ars := self.directory_config.get('ar_buckets', self.dataset_config.get('ar_buckets', None)):
+            self.ars = self._process_user_provided_ars(ars)
         else:
             min_ar = self.directory_config.get('min_ar', self.dataset_config['min_ar'])
             max_ar = self.directory_config.get('max_ar', self.dataset_config['max_ar'])
@@ -357,6 +361,28 @@ class DirectoryDataset:
 
             return {'image_file': [str(image_file)], 'caption': [caption], 'ar_bucket': [ar_bucket], 'is_video': [is_video]}
         return fn
+
+    def _process_user_provided_ars(self, ars):
+        ar_buckets = set()
+        for ar in ars:
+            if isinstance(ar, (tuple, list)):
+                assert len(ar) == 2
+                ar = round(ar[0] / ar[1], 6)
+            ar_buckets.add(ar)
+        ar_buckets = list(ar_buckets)
+        ar_buckets.sort()
+        return np.array(ar_buckets)
+
+    def _process_user_provided_resolutions(self, resolutions):
+        result = set()
+        for res in resolutions:
+            if isinstance(res, (tuple, list)):
+                assert len(res) == 2
+                res = round(math.sqrt(res[0] * res[1]), 6)
+            result.add(res)
+        result = list(result)
+        result.sort()
+        return result
 
     def get_size_bucket_datasets(self):
         result = []
