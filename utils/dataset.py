@@ -664,14 +664,15 @@ class PipelineDataLoader:
         self.dataset = dataset
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.num_dataloader_workers = num_dataloader_workers
-        self.skip_first_n_batches = None
         self.iter_called = False
         self.eval_quantile = None
         self.epoch = 1
         self.num_batches_pulled = 0
         self.next_micro_batch = None
+        self.recreate_dataloader = False
         # Be careful to only create the DataLoader some bounded number of times: https://github.com/pytorch/pytorch/issues/91252
         self._create_dataloader()
+        self.data = self._pull_batches_from_dataloader()
 
     def reset(self):
         self.epoch = 1
@@ -696,17 +697,18 @@ class PipelineDataLoader:
         try:
             self.next_micro_batch = next(self.data)
         except StopIteration:
-            assert self.skip_first_n_batches is None
+            if self.recreate_dataloader:
+                self._create_dataloader()
+                self.recreate_dataloader = False
             self.data = self._pull_batches_from_dataloader()
             self.num_batches_pulled = 0
             self.next_micro_batch = next(self.data)
             self.epoch += 1
         return ret
 
-    def _create_dataloader(self):
-        if self.skip_first_n_batches is not None:
-            sampler = SkipFirstNSampler(self.skip_first_n_batches, len(self.dataset))
-            self.skip_first_n_batches = None
+    def _create_dataloader(self, skip_first_n_batches=None):
+        if skip_first_n_batches is not None:
+            sampler = SkipFirstNSampler(skip_first_n_batches, len(self.dataset))
         else:
             sampler = None
         self.dataloader = torch.utils.data.DataLoader(
@@ -717,7 +719,6 @@ class PipelineDataLoader:
             num_workers=self.num_dataloader_workers,
             persistent_workers=(self.num_dataloader_workers > 0),
         )
-        self.data = self._pull_batches_from_dataloader()
 
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
@@ -750,8 +751,11 @@ class PipelineDataLoader:
         # -1 because by preloading the next micro_batch, it's always going to have one more batch
         # pulled than the actual number of batches iterated by the caller.
         self.num_batches_pulled = state_dict['num_batches_pulled'] - 1
-        self.skip_first_n_batches = self.num_batches_pulled
-        self._create_dataloader()
+        self._create_dataloader(skip_first_n_batches=self.num_batches_pulled)
+        self.data = self._pull_batches_from_dataloader()
+        # Recreate the dataloader after the first pass so that it won't skip
+        # batches again (we only want it to skip batches the first time).
+        self.recreate_dataloader = True
 
 
 class SkipFirstNSampler(torch.utils.data.Sampler):
