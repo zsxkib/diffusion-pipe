@@ -87,6 +87,13 @@ timestep_sample_method = 'logit_normal'
 # dtype = 'bfloat16'
 # flux_shift = true
 
+# LTV-Video example
+# [model]
+# type = 'ltx-video'
+# diffusers_path = '/data2/imagegen_models/LTX-Video'
+# dtype = 'bfloat16'
+# timestep_sample_method = 'logit_normal'
+
 [adapter]
 type = 'lora'
 rank = 32
