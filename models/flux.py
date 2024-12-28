@@ -133,7 +133,7 @@ class FluxPipeline(BasePipeline):
         if transformer_path := self.model_config.get('transformer_path', None):
             transformer_config = 'configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
             transformer = diffusers.FluxTransformer2DModel.from_single_file(
-                self.model_config['transformer'],
+                transformer_path,
                 torch_dtype=self.model_config['dtype'],
                 config=transformer_config,
                 local_files_only=True,
@@ -231,7 +231,7 @@ class FluxPipeline(BasePipeline):
         bs, c, h, w = latents.shape
         latents = rearrange(latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
 
-        img_ids = self._prepare_latent_image_ids(bs, h, w, latents.device, latents.dtype)
+        img_ids = self._prepare_latent_image_ids(bs, h // 2, w // 2, latents.device, latents.dtype)
         if img_ids.ndim == 2:
             # This method must return tensors with batch dimension, since we proceed to split along batch dimension for pipelining.
             img_ids = img_ids.unsqueeze(0).repeat((bs, 1, 1))
