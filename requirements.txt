@@ -3,7 +3,7 @@ torchvision==0.19.1
 deepspeed
 toml
 transformers
-git+https://github.com/huggingface/diffusers/
+diffusers>=0.32.1
 datasets
 pillow
 sentencepiece
