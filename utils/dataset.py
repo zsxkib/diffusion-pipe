@@ -141,7 +141,6 @@ class ConcatenatedBatchedDataset:
             iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
             cumulative_sums[dataset_idx] += 1
         self.iteration_order = iteration_order
-        assert len(self.iteration_order) > 0, 'ConcatenatedBatchedDataset is empty. Are your file paths correct?'
         self.batch_size = batch_size
         self._make_divisible_by(self.batch_size)
         self.post_init_called = True
