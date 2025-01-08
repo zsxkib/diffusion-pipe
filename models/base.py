@@ -107,6 +107,8 @@ class PreprocessMediaFile:
 
 
 class BasePipeline:
+    framerate = None
+
     def load_diffusion_model(self):
         pass
 

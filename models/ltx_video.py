@@ -7,11 +7,10 @@ from diffusers import LTXPipeline
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
 
-FRAMERATE = 25
-
 
 class LTXVideoPipeline(BasePipeline):
     name = 'ltx-video'
+    framerate = 25
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['LTXTransformerBlock', 'LTXVideoTransformerBlock']
 
@@ -50,7 +49,7 @@ class LTXVideoPipeline(BasePipeline):
         return PreprocessMediaFile(
             self.config,
             support_video=True,
-            framerate=FRAMERATE,
+            framerate=self.framerate,
             round_height=32,
             round_width=32,
             round_frames=8,
@@ -116,7 +115,7 @@ class LTXVideoPipeline(BasePipeline):
         num_frames = torch.full((bs,), num_frames)
         height = torch.full((bs,), height)
         width = torch.full((bs,), width)
-        latent_frame_rate = FRAMERATE / self.vae_temporal_compression_ratio
+        latent_frame_rate = self.framerate / self.vae_temporal_compression_ratio
         rope_interpolation_scale_time = torch.full((bs,), 1 / latent_frame_rate)
         rope_interpolation_scale_space = torch.full((bs,), self.vae_spatial_compression_ratio)
 

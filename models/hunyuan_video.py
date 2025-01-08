@@ -27,7 +27,6 @@ from hyvideo.diffusion.pipelines import HunyuanVideoPipeline as OriginalHunyuanV
 from hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 
 
-FRAMERATE = 24
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
 
@@ -189,6 +188,7 @@ def vae_encode(tensor, vae):
 
 class HunyuanVideoPipeline(BasePipeline):
     name = 'hunyuan-video'
+    framerate = 24
     checkpointable_layers = ['DoubleBlock', 'SingleBlock']
     adapter_target_modules = ['MMDoubleStreamBlock', 'MMSingleStreamBlock']
 
@@ -350,7 +350,7 @@ class HunyuanVideoPipeline(BasePipeline):
         return PreprocessMediaFile(
             self.config,
             support_video=True,
-            framerate=FRAMERATE,
+            framerate=self.framerate,
             round_height=8,
             round_width=8,
             round_frames=4,
