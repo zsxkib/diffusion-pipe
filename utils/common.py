@@ -50,3 +50,11 @@ def load_safetensors(path):
         for key in f.keys():
             tensors[key] = f.get_tensor(key)
     return tensors
+
+
+def round_to_nearest_multiple(x, multiple):
+    return int(round(x / multiple) * multiple)
+
+
+def round_down_to_multiple(x, multiple):
+    return int((x // multiple) * multiple)

@@ -15,7 +15,7 @@ from PIL import Image
 import imageio
 import multiprocess as mp
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, log_duration
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 
 
 DEBUG = False
@@ -45,8 +45,7 @@ def process_caption_fn(shuffle_tags=False, caption_prefix=''):
     return fn
 
 
-def round_to_multiple(x, multiple):
-    return int(round(x / multiple) * multiple)
+
 
 
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, with_indices=False):
@@ -178,8 +177,8 @@ class ARBucketDataset:
             area = res**2
             w = math.sqrt(area * self.ar_frames[0])
             h = area / w
-            w = round_to_multiple(w, IMAGE_SIZE_ROUND_TO_MULTIPLE)
-            h = round_to_multiple(h, IMAGE_SIZE_ROUND_TO_MULTIPLE)
+            w = round_to_nearest_multiple(w, IMAGE_SIZE_ROUND_TO_MULTIPLE)
+            h = round_to_nearest_multiple(h, IMAGE_SIZE_ROUND_TO_MULTIPLE)
             size_bucket = (w, h, self.ar_frames[1])
             metadata_with_size_bucket = self.metadata_dataset.map(lambda example: {'size_bucket': size_bucket}, keep_in_memory=True)
             self.size_buckets.append(
