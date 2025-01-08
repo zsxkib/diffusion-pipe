@@ -45,9 +45,6 @@ def process_caption_fn(shuffle_tags=False, caption_prefix=''):
     return fn
 
 
-
-
-
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1, with_indices=False):
     # Do the fingerprinting ourselves, because otherwise map() does it by serializing the map function.
     # That goes poorly when the function is capturing huge models (slow, OOMs, etc).
