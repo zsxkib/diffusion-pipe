@@ -321,6 +321,10 @@ class DirectoryDataset:
             empty_return = {'image_file': [], 'caption': [], 'ar_bucket': [], 'is_video': []}
 
             image_file = Path(image_file)
+            if image_file.suffix == '.webp':
+                frames = imageio.get_reader(image_file).get_length()
+                if frames > 1:
+                    raise NotImplementedError('WebP videos are not supported.')
             try:
                 if image_file.suffix in VIDEO_EXTENSIONS:
                     # 100% accurate frame count, but much slower.
@@ -338,7 +342,7 @@ class DirectoryDataset:
                     width, height = pil_img.size
                     frames = 1
             except Exception:
-                logger.warning(f'Image file {image_file} could not be opened. Skipping.')
+                logger.warning(f'Media file {image_file} could not be opened. Skipping.')
                 return empty_return
             is_video = (frames > 1)
             log_ar = np.log(width / height)

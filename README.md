@@ -49,6 +49,11 @@ Install the dependencies:
 pip install -r requirements.txt
 ```
 
+## Dataset preparation
+A dataset consists of one or more directories containing image or video files, and corresponding captions. You can mix images and videos in the same directory, but it's probably a good idea to separate them in case you need to specify certain settings on a per-directory basis. Caption files should be .txt files with the same base name as the corresponding media file, e.g. image1.png should have caption file image1.txt in the same directory. If a media file doesn't have a matching caption file, a warning is printed, but training will proceed with an empty caption.
+
+For images, any image format that can be loaded by Pillow should work. For videos, any format that can be loaded by ImageIO should work. Note that this means **WebP videos are not supported**, because ImageIO can't load multi-frame WebPs.
+
 ## Training
 **Start by reading through the config files in the examples directory.** Almost everything is commented, explaining what each setting does.
 
