@@ -460,7 +460,7 @@ if __name__ == '__main__':
         num_steps += 1
         train_dataloader.sync_epoch()
 
-        new_epoch = saver.process_epoch(epoch, step)
+        new_epoch, checkpointed, saved = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False
 
         if is_main_process() and step % config['logging_steps'] == 0:
@@ -480,6 +480,12 @@ if __name__ == '__main__':
 
         saver.process_step(step)
         step += 1
+
+    # Save final training state checkpoint and model, unless we just saved them.
+    if not checkpointed:
+        saver.save_checkpoint(step)
+    if not saved:
+        saver.save_model(f'epoch{epoch}')
 
     if is_main_process():
         print('TRAINING COMPLETE!')
