@@ -45,10 +45,10 @@ def need_to_checkpoint(config, epoch=None):
 
 
 class Saver:
-    def __init__(self, args, config, peft_config, save_root, model, train_dataloader, model_engine, pipeline_model):
+    def __init__(self, args, config, is_adapter, save_root, model, train_dataloader, model_engine, pipeline_model):
         self.args = args
         self.config = config
-        self.peft_config = peft_config
+        self.is_adapter = is_adapter
         self.save_root = Path(save_root)
         self.model = model
         self.train_dataloader = train_dataloader
@@ -110,7 +110,7 @@ class Saver:
     def save_model(self, name):
         if is_main_process():
             print(f'Saving model to directory {name}')
-        if self.peft_config is not None:
+        if self.is_adapter:
             self.save_adapter(name)
         else:
             self.save_full_model(name)

@@ -210,6 +210,9 @@ if __name__ == '__main__':
     elif model_type == 'hunyuan-video':
         from models import hunyuan_video
         model = hunyuan_video.HunyuanVideoPipeline(config)
+    elif model_type == 'sdxl':
+        from models import sdxl
+        model = sdxl.SDXLPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -256,11 +259,12 @@ if __name__ == '__main__':
     model.load_diffusion_model()
 
     if adapter_config := config.get('adapter', None):
-        peft_config = model.configure_adapter(adapter_config)
+        model.configure_adapter(adapter_config)
+        is_adapter = True
         if init_from_existing := adapter_config.get('init_from_existing', None):
             model.load_adapter_weights(init_from_existing)
     else:
-        peft_config = None
+        is_adapter = False
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
@@ -444,7 +448,7 @@ if __name__ == '__main__':
 
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
-    saver = utils.saver.Saver(args, config, peft_config, run_dir, model, train_dataloader, model_engine, pipeline_model)
+    saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'])
