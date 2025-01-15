@@ -10,6 +10,45 @@ from models.base import BasePipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE
 
 
+# Copied from https://github.com/kohya-ss/sd-scripts/blob/main/library/custom_train_functions.py
+def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
+    # fix beta: zero terminal SNR
+    logger.info(f"fix noise scheduler betas: https://arxiv.org/abs/2305.08891")
+
+    def enforce_zero_terminal_snr(betas):
+        # Convert betas to alphas_bar_sqrt
+        alphas = 1 - betas
+        alphas_bar = alphas.cumprod(0)
+        alphas_bar_sqrt = alphas_bar.sqrt()
+
+        # Store old values.
+        alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
+        alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+        # Shift so last timestep is zero.
+        alphas_bar_sqrt -= alphas_bar_sqrt_T
+        # Scale so first timestep is back to old value.
+        alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+
+        # Convert alphas_bar_sqrt to betas
+        alphas_bar = alphas_bar_sqrt**2
+        alphas = alphas_bar[1:] / alphas_bar[:-1]
+        alphas = torch.cat([alphas_bar[0:1], alphas])
+        betas = 1 - alphas
+        return betas
+
+    betas = noise_scheduler.betas
+    betas = enforce_zero_terminal_snr(betas)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+    # logger.info(f"original: {noise_scheduler.betas}")
+    # logger.info(f"fixed: {betas}")
+
+    noise_scheduler.betas = betas
+    noise_scheduler.alphas = alphas
+    noise_scheduler.alphas_cumprod = alphas_cumprod
+
+
 class SDXLPipeline(BasePipeline):
     # Unique name, used to make the cache_dir path.
     name = 'sdxl'
@@ -26,6 +65,9 @@ class SDXLPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
+        self.v_pred = self.model_config.get('v_pred', False)
+        if self.v_pred:
+            logger.info('Using v-prediction loss')
         self.diffusers_pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(
             self.model_config['checkpoint_path'],
             torch_dtype=self.model_config['dtype'],
@@ -34,6 +76,9 @@ class SDXLPipeline(BasePipeline):
         self.diffusers_pipeline.scheduler = diffusers.DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
         )
+        if self.v_pred:
+            fix_noise_scheduler_betas_for_zero_terminal_snr(self.diffusers_pipeline.scheduler)
+
         # Probably good to always do this for SDXL.
         self.diffusers_pipeline.upcast_vae()
         self.unet.train()
@@ -123,7 +168,11 @@ class SDXLPipeline(BasePipeline):
         else:
             timesteps = torch.randint(min_timestep, max_timestep, (bs,), device=device)
         noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
-        target = noise
+
+        if self.v_pred:
+            target = self.scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            target = noise
 
         pixel_height = latents.shape[-2] * self.vae_scale_factor
         pixel_width = latents.shape[-1] * self.vae_scale_factor
