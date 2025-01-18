@@ -94,6 +94,14 @@ timestep_sample_method = 'logit_normal'
 # dtype = 'bfloat16'
 # timestep_sample_method = 'logit_normal'
 
+# SDXL example
+# [model]
+# type = 'sdxl'
+# checkpoint_path = '/data2/imagegen_models/sdxl/sd_xl_base_1.0_0.9vae.safetensors'
+# dtype = 'bfloat16'
+# # You can train v-prediction models (e.g. NoobAI vpred) by setting this option.
+# #v_pred = true
+
 [adapter]
 type = 'lora'
 rank = 32
