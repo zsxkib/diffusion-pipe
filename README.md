@@ -100,5 +100,7 @@ Two flags are relevant for caching. ```--cache_only``` does the caching flow, th
 ## LoRA format
 LoRAs use Diffusers to save when possible. Where Diffusers does not have official LoRA support for a model, the state_dict format follows the typical Diffusers convention: the weight keys are formatted as PEFT does, and prefixed with the attribute name of the model on the Diffusers pipeline object (e.g. prefixed with "transformer.").
 
+SDXL is an exception; the LoRAs are saved in Kohya sd-scripts format.
+
 ## Extra
 You can check out my [qlora-pipe](https://github.com/tdrussell/qlora-pipe) project, which is basically the same thing as this but for LLMs.
