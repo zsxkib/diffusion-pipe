@@ -25,7 +25,9 @@ num_ar_buckets = 7
 # For video training, you need to configure frame buckets (similar to aspect ratio buckets). There will always
 # be a frame bucket of 1 for images. Videos will be assigned to the first frame bucket that the video is greater than or equal to in length.
 # But videos are never assigned to the image frame bucket (1); if the video is very short it would just be dropped.
-frame_buckets = [1, 33, 65]
+frame_buckets = [1, 33]
+# If you have >24GB VRAM, or multiple GPUs and use pipeline parallelism, or lower the spatial resolution, you could maybe train with longer frame buckets
+# frame_buckets = [1, 33, 65, 97]
 
 
 [[directory]]
