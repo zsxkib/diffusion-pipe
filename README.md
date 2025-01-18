@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Currently supports Flux, LTX-Video, and HunyuanVideo.
+Currently supports SDXL, Flux, LTX-Video, and HunyuanVideo.
 
 **Work in progress and highly experimental.** It is unstable and not well tested. Things might not work right.
 
