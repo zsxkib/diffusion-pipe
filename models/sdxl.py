@@ -11,6 +11,21 @@ from utils.common import AUTOCAST_DTYPE
 
 
 # Copied from https://github.com/kohya-ss/sd-scripts/blob/main/library/custom_train_functions.py
+
+def prepare_scheduler_for_custom_training(noise_scheduler):
+    if hasattr(noise_scheduler, "all_snr"):
+        return
+
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+    alpha = sqrt_alphas_cumprod
+    sigma = sqrt_one_minus_alphas_cumprod
+    all_snr = (alpha / sigma) ** 2
+
+    noise_scheduler.all_snr = all_snr
+
+
 def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
     # fix beta: zero terminal SNR
     logger.info(f"fix noise scheduler betas: https://arxiv.org/abs/2305.08891")
@@ -49,6 +64,20 @@ def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
     noise_scheduler.alphas_cumprod = alphas_cumprod
 
 
+def apply_snr_weight(loss, timesteps, noise_scheduler, gamma, v_prediction=False):
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    min_snr_gamma = torch.minimum(snr, torch.full_like(snr, gamma))
+    if v_prediction:
+        # TODO: in sd-scripts, this commit: https://github.com/kohya-ss/sd-scripts/commit/6b3148fd3fb64e41aa29fc1759ebfab3a4504d45
+        # made it so with v-pred, scale_v_prediction_loss_like_noise_prediction is built-in here. Is this the right thing to do?
+        # I.e., does min_snr_gamma only make sense in the context of scaling v-pred loss to be like noise prediction?
+        snr_weight = torch.div(min_snr_gamma, snr + 1).float().to(loss.device)
+    else:
+        snr_weight = torch.div(min_snr_gamma, snr).float().to(loss.device)
+    loss = loss * snr_weight
+    return loss
+
+
 class SDXLPipeline(BasePipeline):
     # Unique name, used to make the cache_dir path.
     name = 'sdxl'
@@ -66,8 +95,13 @@ class SDXLPipeline(BasePipeline):
         self.config = config
         self.model_config = self.config['model']
         self.v_pred = self.model_config.get('v_pred', False)
+        self.min_snr_gamma = self.model_config.get('min_snr_gamma', None)
+
         if self.v_pred:
             logger.info('Using v-prediction loss')
+        if self.min_snr_gamma is not None:
+            logger.info(f'Using min_snr_gamma={self.min_snr_gamma}')
+
         self.diffusers_pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(
             self.model_config['checkpoint_path'],
             torch_dtype=self.model_config['dtype'],
@@ -76,8 +110,12 @@ class SDXLPipeline(BasePipeline):
         self.diffusers_pipeline.scheduler = diffusers.DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
         )
+
+        # TODO: sd-scripts has this come first. But that's technically wrong I think. You would want to change the scheduler
+        # parameters to enforce ZTSNR before calculating the SNRs. Leaving it like this for now to match sd-scripts.
+        prepare_scheduler_for_custom_training(self.scheduler)
         if self.v_pred:
-            fix_noise_scheduler_betas_for_zero_terminal_snr(self.diffusers_pipeline.scheduler)
+            fix_noise_scheduler_betas_for_zero_terminal_snr(self.scheduler)
 
         # Probably good to always do this for SDXL.
         self.diffusers_pipeline.upcast_vae()
@@ -221,7 +259,7 @@ class SDXLPipeline(BasePipeline):
         for i, block in enumerate(unet.up_blocks):
             is_final_block = i == len(unet.up_blocks) - 1
             layers.append(UnetUpBlockLayer(block, is_final_block))
-        layers.append(FinalLayer(unet))
+        layers.append(FinalLayer(unet, self))
         return layers
 
 
@@ -304,7 +342,7 @@ class InitialLayer(nn.Module):
         sample = self.conv_in(sample)
         down_block_res_samples = (sample,)
 
-        return make_contiguous(sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
+        return make_contiguous(sample, timestep, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
 
 
 class UnetDownBlockLayer(nn.Module):
@@ -314,7 +352,7 @@ class UnetDownBlockLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
+        sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
 
         if hasattr(self.block, "has_cross_attention") and self.block.has_cross_attention:
             sample, res_samples = self.block(
@@ -326,7 +364,7 @@ class UnetDownBlockLayer(nn.Module):
             sample, res_samples = self.block(hidden_states=sample, temb=emb)
 
         down_block_res_samples += res_samples
-        return make_contiguous(sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
+        return make_contiguous(sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
 
 
 class UnetMidBlockLayer(nn.Module):
@@ -336,7 +374,7 @@ class UnetMidBlockLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
+        sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
 
         if hasattr(self.block, "has_cross_attention") and self.block.has_cross_attention:
             sample = self.block(
@@ -347,7 +385,7 @@ class UnetMidBlockLayer(nn.Module):
         else:
             sample = self.mid_block(sample, emb)
 
-        return make_contiguous(sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
+        return make_contiguous(sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
 
 
 class UnetUpBlockLayer(nn.Module):
@@ -358,7 +396,7 @@ class UnetUpBlockLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
+        sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
 
         res_samples = down_block_res_samples[-len(self.block.resnets) :]
         down_block_res_samples = down_block_res_samples[: -len(self.block.resnets)]
@@ -386,19 +424,20 @@ class UnetUpBlockLayer(nn.Module):
                 upsample_size=upsample_size,
             )
 
-        return make_contiguous(sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
+        return make_contiguous(sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, unet):
+    def __init__(self, unet, pipeline):
         super().__init__()
+        self.pipeline = pipeline
         self.conv_norm_out = unet.conv_norm_out
         self.conv_act = unet.conv_act
         self.conv_out = unet.conv_out
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        sample, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
+        sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target = inputs
 
         if self.conv_norm_out:
             sample = self.conv_norm_out(sample)
@@ -407,5 +446,10 @@ class FinalLayer(nn.Module):
 
         sample = sample.to(torch.float32)
         target = target.to(torch.float32)
-        loss = F.mse_loss(sample, target)
-        return loss
+        loss = F.mse_loss(sample, target, reduction='none')
+        loss = loss.mean([1, 2, 3])
+
+        if self.pipeline.min_snr_gamma is not None:
+            loss = apply_snr_weight(loss, timesteps, self.pipeline.scheduler, self.pipeline.min_snr_gamma, self.pipeline.v_pred)
+
+        return loss.mean()
