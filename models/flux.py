@@ -223,7 +223,7 @@ class FluxPipeline(BasePipeline):
             raise RuntimeError(f'Text encoder {text_encoder.__class__} does not have a function to call it')
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
-        latents = inputs['latents']
+        latents = inputs['latents'].float()
         clip_embed = inputs['clip_embed']
         t5_embed = inputs['t5_embed']
 

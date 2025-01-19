@@ -190,7 +190,7 @@ class SDXLPipeline(BasePipeline):
         return fn
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
-        latents = inputs['latents']
+        latents = inputs['latents'].float()
         caption = inputs['caption']
         input_ids = self._get_input_ids(caption, self.tokenizer)
         input_ids_2 = self._get_input_ids(caption, self.tokenizer_2)
