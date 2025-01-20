@@ -87,6 +87,15 @@ timestep_sample_method = 'logit_normal'
 # dtype = 'bfloat16'
 # flux_shift = true
 
+# ostris/Flex.1-alpha example
+# [model]
+# type = 'flux'
+# diffusers_path = '/data2/imagegen_models/Flex.1-alpha'
+# dtype = 'bfloat16'
+# flux_shift = true
+# # This model is designed to be finetuned with the guidance embedding bypassed
+# bypass_guidance_embedding = true
+
 # LTV-Video example
 # [model]
 # type = 'ltx-video'

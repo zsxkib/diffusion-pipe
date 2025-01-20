@@ -1,4 +1,6 @@
 import math
+import os.path
+from functools import partial
 
 import diffusers
 import torch
@@ -10,7 +12,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from models.base import BasePipeline, make_contiguous
-from utils.common import AUTOCAST_DTYPE
+from utils.common import AUTOCAST_DTYPE, is_main_process
 
 NUM_DOUBLE_BLOCKS = 19
 NUM_SINGLE_BLOCKS = 38
@@ -112,6 +114,27 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
     return lambda x: m * x + b
 
 
+def guidance_embed_bypass_forward(self, timestep, guidance, pooled_projection):
+    timesteps_proj = self.time_proj(timestep)
+    timesteps_emb = self.timestep_embedder(
+        timesteps_proj.to(dtype=pooled_projection.dtype))  # (N, D)
+    pooled_projections = self.text_embedder(pooled_projection)
+    conditioning = timesteps_emb + pooled_projections
+    return conditioning
+
+
+def bypass_flux_guidance(transformer):
+    if hasattr(transformer.time_text_embed, '_bfg_orig_forward'):
+        return
+    # dont bypass if it doesnt have the guidance embedding
+    if not hasattr(transformer.time_text_embed, 'guidance_embedder'):
+        return
+    transformer.time_text_embed._bfg_orig_forward = transformer.time_text_embed.forward
+    transformer.time_text_embed.forward = partial(
+        guidance_embed_bypass_forward, transformer.time_text_embed
+    )
+
+
 class FluxPipeline(BasePipeline):
     # Unique name, used to make the cache_dir path.
     name = 'flux'
@@ -129,17 +152,30 @@ class FluxPipeline(BasePipeline):
         self.model_config = self.config['model']
         if 'transformer_dtype' in self.model_config:
             raise NotImplementedError('Flux does not currently support transformer_dtype (e.g. float8)')
-        kwargs = {}
+        dtype = self.model_config['dtype']
+
         if transformer_path := self.model_config.get('transformer_path', None):
+            if is_main_process():
+                print(f'Overriding transformer using {transformer_path}')
             transformer_config = 'configs/flux_dev_config.json' if is_dev(transformer_path) else 'configs/flux_schnell_config.json'
             transformer = diffusers.FluxTransformer2DModel.from_single_file(
                 transformer_path,
-                torch_dtype=self.model_config['dtype'],
+                torch_dtype=dtype,
                 config=transformer_config,
                 local_files_only=True,
             )
-            kwargs['transformer'] = transformer
-        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=self.model_config['dtype'], **kwargs)
+        else:
+            transformer = diffusers.FluxTransformer2DModel.from_pretrained(
+                os.path.join(self.model_config['diffusers_path'], 'transformer'),
+                torch_dtype=dtype,
+            )
+        if self.model_config.get('bypass_guidance_embedding', False):
+            if is_main_process():
+                print('Bypassing Flux guidance')
+            bypass_flux_guidance(transformer)
+
+        self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=transformer)
+
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
         # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
