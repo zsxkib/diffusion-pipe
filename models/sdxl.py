@@ -302,7 +302,7 @@ class InitialLayer(nn.Module):
                 # Forward upsample size to force interpolation output size.
                 forward_upsample_size = True
                 break
-        forward_upsample_size = torch.tensor(forward_upsample_size)
+        forward_upsample_size = torch.tensor(forward_upsample_size).to(sample.device)
 
         prompt_embeds_list = []
         for text_input_ids, text_encoder in [(input_ids, self.text_encoder), (input_ids_2, self.text_encoder_2)]:

@@ -61,7 +61,6 @@ steps_per_print = 1
 video_clip_mode = 'single_middle'
 
 [model]
-# flux, ltx-video, or hunyuan-video
 type = 'hunyuan-video'
 # Can load Hunyuan Video entirely from the ckpt path set up for the official inference scripts.
 #ckpt_path = '/home/anon/HunyuanVideo/ckpts'
@@ -83,7 +82,7 @@ timestep_sample_method = 'logit_normal'
 # # Path to Huggingface Diffusers directory for Flux
 # diffusers_path = '/data2/imagegen_models/FLUX.1-dev'
 # # You can override the transformer from a BFL format checkpoint.
-# transformer_path = '/data2/imagegen_models/flux-dev-single-files/consolidated_s6700-schnell.safetensors'
+# #transformer_path = '/data2/imagegen_models/flux-dev-single-files/consolidated_s6700-schnell.safetensors'
 # dtype = 'bfloat16'
 # flux_shift = true
 

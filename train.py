@@ -278,7 +278,7 @@ if __name__ == '__main__':
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}
     if config['activation_checkpointing']:
-        checkpoint_func = deepspeed.checkpointing.checkpoint
+        checkpoint_func = deepspeed.checkpointing.non_reentrant_checkpoint
         additional_pipeline_module_kwargs.update({
             'activation_checkpoint_interval': 1,
             'checkpointable_layers': model.checkpointable_layers,
