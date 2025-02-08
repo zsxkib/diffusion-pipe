@@ -1,3 +1,6 @@
 [submodule "submodules/HunyuanVideo"]
 	path = submodules/HunyuanVideo
 	url = https://github.com/Tencent/HunyuanVideo
+[submodule "submodules/Cosmos"]
+	path = submodules/Cosmos
+	url = https://github.com/NVIDIA/Cosmos
