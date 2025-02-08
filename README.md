@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Currently supports SDXL, Flux, LTX-Video, and HunyuanVideo.
+Currently supports SDXL, Flux, LTX-Video, HunyuanVideo, Cosmos.
 
 **Work in progress and highly experimental.** It is unstable and not well tested. Things might not work right.
 
@@ -10,7 +10,7 @@ Currently supports SDXL, Flux, LTX-Video, and HunyuanVideo.
 - Full fine tune support for:
     - Flux
 - LoRA support for:
-    - SDXL, Flux, LTX-Video, HunyuanVideo
+    - SDXL, Flux, LTX-Video, HunyuanVideo, Cosmos
 - Useful metrics logged to Tensorboard
 - Compute metrics on a held-out eval set, for measuring generalization
 - Training state checkpointing and resuming from checkpoint
