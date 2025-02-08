@@ -74,6 +74,9 @@ BFL_TO_DIFFUSERS_MAP = {
 }
 
 
+KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'time_text_embed', 'context_embedder', 'x_embedder']
+
+
 def make_diffusers_to_bfl_map(num_double_blocks: int = NUM_DOUBLE_BLOCKS, num_single_blocks: int = NUM_SINGLE_BLOCKS) -> dict[str, tuple[int, str]]:
     # make reverse map from diffusers map
     diffusers_to_bfl_map = {}  # key: diffusers_key, value: (index, bfl_key)
@@ -150,9 +153,8 @@ class FluxPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
-        if 'transformer_dtype' in self.model_config:
-            raise NotImplementedError('Flux does not currently support transformer_dtype (e.g. float8)')
         dtype = self.model_config['dtype']
+        transformer_dtype = self.model_config.get('transformer_dtype', dtype)
 
         if transformer_path := self.model_config.get('transformer_path', None):
             if is_main_process():
@@ -173,6 +175,10 @@ class FluxPipeline(BasePipeline):
             if is_main_process():
                 print('Bypassing Flux guidance')
             bypass_flux_guidance(transformer)
+
+        for name, p in transformer.named_parameters():
+            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION) or name.startswith('proj_out')):
+                p.data = p.data.to(transformer_dtype)
 
         self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=transformer)
 

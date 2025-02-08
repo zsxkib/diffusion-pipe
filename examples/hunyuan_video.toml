@@ -84,6 +84,8 @@ timestep_sample_method = 'logit_normal'
 # # You can override the transformer from a BFL format checkpoint.
 # #transformer_path = '/data2/imagegen_models/flux-dev-single-files/consolidated_s6700-schnell.safetensors'
 # dtype = 'bfloat16'
+# # Flux supports fp8 for the transformer when training LoRA.
+# transformer_dtype = 'float8'
 # flux_shift = true
 
 # ostris/Flex.1-alpha example
