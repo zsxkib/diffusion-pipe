@@ -35,6 +35,7 @@ parser.add_argument('--local_rank', type=int, default=-1,
 parser.add_argument('--resume_from_checkpoint', action='store_true', default=None, help='resume training from the most recent checkpoint')
 parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache. Useful if none of the files have changed but their contents have, e.g. modified captions.')
 parser.add_argument('--cache_only', action='store_true', default=None, help='Cache model inputs then exit.')
+parser.add_argument('--i_know_what_i_am_doing', action='store_true', default=None, help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -213,6 +214,9 @@ if __name__ == '__main__':
     elif model_type == 'sdxl':
         from models import sdxl
         model = sdxl.SDXLPipeline(config)
+    elif model_type == 'cosmos':
+        from models import cosmos
+        model = cosmos.CosmosPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -236,7 +240,7 @@ if __name__ == '__main__':
     caching_batch_size = config.get('caching_batch_size', 1)
     dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
 
-    train_data = dataset_util.Dataset(dataset_config, model)
+    train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_override=args.i_know_what_i_am_doing)
     dataset_manager.register(train_data)
 
     eval_data_map = {}
@@ -249,7 +253,7 @@ if __name__ == '__main__':
             config_path = eval_dataset['config']
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model)
+        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, skip_dataset_override=args.i_know_what_i_am_doing)
         dataset_manager.register(eval_data_map[name])
 
     dataset_manager.cache()

@@ -114,6 +114,14 @@ timestep_sample_method = 'logit_normal'
 # # Min SNR is supported. Same meaning as sd-scripts
 # #min_snr_gamma = 5
 
+# Cosmos example
+# [model]
+# type = 'cosmos'
+# transformer_path = '/data2/imagegen_models/cosmos/cosmos-1.0-diffusion-7b-text2world.pt'
+# vae_path = '/data2/imagegen_models/cosmos/cosmos_cv8x8x8_1.0.safetensors'
+# text_encoder_path = '/data2/imagegen_models/cosmos/oldt5_xxl_fp16.safetensors'
+# dtype = 'bfloat16'
+
 [adapter]
 type = 'lora'
 rank = 32
