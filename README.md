@@ -18,6 +18,9 @@ Currently supports SDXL, Flux, LTX-Video, and HunyuanVideo.
 - Easily add support for new models by implementing a single subclass
 
 ## Recent changes
+- 2025-02-08
+  - Support fp8 transformer for Flux LoRAs. You can now train LoRAs with a single 24GB GPU.
+  - Add tentative support for Cosmos. Cosmos doesn't fine tune well compared to HunyuanVideo, and will likely not be actively supported going forward.
 - 2025-01-20
   - Properly support training Flex.1-alpha.
   - Make sure to set ```bypass_guidance_embedding=true``` in the model config. You can look at the example config file.
@@ -68,6 +71,9 @@ A dataset consists of one or more directories containing image or video files, a
 
 For images, any image format that can be loaded by Pillow should work. For videos, any format that can be loaded by ImageIO should work. Note that this means **WebP videos are not supported**, because ImageIO can't load multi-frame WebPs.
 
+## Supported models
+See the [supported models doc](./docs/supported_models.md) for more information on how to configure each model, the options it supports, and the format of the saved LoRAs.
+
 ## Training
 **Start by reading through the config files in the examples directory.** Almost everything is commented, explaining what each setting does.
 
@@ -84,18 +90,6 @@ If you enabled checkpointing, you can resume training from the latest checkpoint
 ## Output files
 A new directory will be created in ```output_dir``` for each training run. This contains the checkpoints, saved models, and Tensorboard metrics. Saved models/LoRAs will be in directories named like epoch1, epoch2, etc. Deepspeed checkpoints are in directories named like global_step1234. These checkpoints contain all training state, including weights, optimizer, and dataloader state, but can't be used directly for inference. The saved model directory will have the safetensors weights, PEFT adapter config JSON, as well as the diffusion-pipe config file for easier tracking of training run settings.
 
-## VRAM requirements
-### Flux
-Flux doesn't currently support training a LoRA on a fp8 base model (if you want this, PRs are welcome :) ). So you need to use a >24GB GPU, or use pipeline_stages=2 or higher with multiple 24GB cards. With four 24GB GPUs, you can even full finetune Flux with the right techniques (see the train.py code about gradient release and the custom AdamW8bitKahan optimizer).
-
-### HunyuanVideo
-HunyuanVideo supports fp8 transformer. The example config file will train a HunyuanVideo LoRA, on images only, in well under 24GB of VRAM. You can probably bump the resolution to 1024x1024 or higher.
-
-Video uses A LOT more memory. I was able to train a rank 32 LoRA on 512x512x33 sized videos in just under 23GB VRAM usage. Pipeline parallelism will help a bit if you have multiple GPUs, since the model weights will be further divided among them (but it doesn't help with the huge activation memory use of videos). Long term I want to eventually implement ring attention and/or Deepspeed Ulysses for parallelizing the sequence dimension across GPUs, which should greatly help for training on videos.
-
-### LTX-Video
-I've barely done any training on LTX-Video. The model is much lighter than Hunyuan, and the latent space more compressed, so it uses less memory. You can train loras even on video at a reasonable length (I forgot exactly what it was) on 24GB.
-
 ## Parallelism
 This code uses hybrid data- and pipeline-parallelism. Set the ```--num_gpus``` flag appropriately for your setup. Set ```pipeline_stages``` in the config file to control the degree of pipeline parallelism. Then the data parallelism degree will automatically be set to use all GPUs (number of GPUs must be divisible by pipeline_stages). For example, with 4 GPUs and pipeline_stages=2, you will run two instances of the model, each divided across two GPUs.
 
@@ -105,11 +99,6 @@ Latents and text embeddings are cached to disk before training happens. This way
 This caching also means that training LoRAs for text encoders is not currently supported.
 
 Two flags are relevant for caching. ```--cache_only``` does the caching flow, then exits without training anything. ```--regenerate_cache``` forces cache regeneration. If you edit the dataset in-place (like changing a caption), you need to force regenerate the cache (or delete the cache dir) for the changes to be picked up.
-
-## LoRA format
-LoRAs use Diffusers to save when possible. Where Diffusers does not have official LoRA support for a model, the state_dict format follows the typical Diffusers convention: the weight keys are formatted as PEFT does, and prefixed with the attribute name of the model on the Diffusers pipeline object (e.g. prefixed with "transformer.").
-
-SDXL is an exception; the LoRAs are saved in Kohya sd-scripts format.
 
 ## Extra
 You can check out my [qlora-pipe](https://github.com/tdrussell/qlora-pipe) project, which is basically the same thing as this but for LLMs.
