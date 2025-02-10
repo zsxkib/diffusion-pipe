@@ -77,7 +77,7 @@ class PreprocessMediaFile:
             num_frames = 0
             for frame in imageio.v3.imiter(filepath, fps=self.framerate):
                 num_frames += 1
-                height, width = frame[-2:]
+                height, width = frame.shape[:2]
             video = imageio.v3.imiter(filepath, fps=self.framerate)
         else:
             num_frames = 1
