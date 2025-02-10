@@ -1,4 +1,5 @@
 import math
+from typing import List, Tuple
 import sys
 import os.path
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules'))
@@ -194,10 +195,98 @@ class InitialLayer(nn.Module):
         adaln_input = t
         cap_feats = self.cap_embedder(cap_feats)
         x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t)
-        img_size = torch.tensor(img_size)
-        cap_size = torch.tensor(cap_size)
+        img_size = torch.tensor(img_size).to(x.device)
+        cap_size = torch.tensor(cap_size).to(x.device)
         freqs_cis = freqs_cis.to(x.device)
         return make_contiguous(x, mask, freqs_cis, adaln_input, img_size, cap_size, target)
+
+    def patchify_and_embed(
+        self, x: List[torch.Tensor] | torch.Tensor, cap_feats: torch.Tensor, cap_mask: torch.Tensor, t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int, int]], List[int], torch.Tensor]:
+        bsz = len(x)
+        pH = pW = self.patch_size
+        device = x[0].device
+
+        l_effective_cap_len = cap_mask.sum(dim=1).tolist()
+        img_sizes = [(img.size(1), img.size(2)) for img in x]
+        l_effective_img_len = [(H // pH) * (W // pW) for (H, W) in img_sizes]
+
+        first_img_len = l_effective_img_len[0]
+        for img_len in l_effective_img_len:
+            assert img_len == first_img_len
+        # Modification from original code: don't allow seq_len to vary dynamically. Pipeline parallelism requires that the tensors
+        # passed between layers always be the same size!
+        max_seq_len = first_img_len + cap_mask.shape[-1]
+        max_cap_len = max(l_effective_cap_len)
+        max_img_len = max(l_effective_img_len)
+
+        position_ids = torch.zeros(bsz, max_seq_len, 3, dtype=torch.int32, device=device)
+
+        for i in range(bsz):
+            cap_len = l_effective_cap_len[i]
+            img_len = l_effective_img_len[i]
+            H, W = img_sizes[i]
+            H_tokens, W_tokens = H // pH, W // pW
+            assert H_tokens * W_tokens == img_len
+
+            position_ids[i, :cap_len, 0] = torch.arange(cap_len, dtype=torch.int32, device=device)
+            position_ids[i, cap_len:cap_len+img_len, 0] = cap_len
+            row_ids = torch.arange(H_tokens, dtype=torch.int32, device=device).view(-1, 1).repeat(1, W_tokens).flatten()
+            col_ids = torch.arange(W_tokens, dtype=torch.int32, device=device).view(1, -1).repeat(H_tokens, 1).flatten()
+            position_ids[i, cap_len:cap_len+img_len, 1] = row_ids
+            position_ids[i, cap_len:cap_len+img_len, 2] = col_ids
+
+        freqs_cis = self.rope_embedder(position_ids)
+
+        # build freqs_cis for cap and image individually
+        cap_freqs_cis_shape = list(freqs_cis.shape)
+        # cap_freqs_cis_shape[1] = max_cap_len
+        cap_freqs_cis_shape[1] = cap_feats.shape[1]
+        cap_freqs_cis = torch.zeros(*cap_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
+
+        img_freqs_cis_shape = list(freqs_cis.shape)
+        img_freqs_cis_shape[1] = max_img_len
+        img_freqs_cis = torch.zeros(*img_freqs_cis_shape, device=device, dtype=freqs_cis.dtype)
+
+        for i in range(bsz):
+            cap_len = l_effective_cap_len[i]
+            img_len = l_effective_img_len[i]
+            cap_freqs_cis[i, :cap_len] = freqs_cis[i, :cap_len]
+            img_freqs_cis[i, :img_len] = freqs_cis[i, cap_len:cap_len+img_len]
+
+        # refine context
+        for layer in self.context_refiner:
+            cap_feats = layer(cap_feats, cap_mask, cap_freqs_cis)
+
+        # refine image
+        flat_x = []
+        for i in range(bsz):
+            img = x[i]
+            C, H, W = img.size()
+            img = img.view(C, H // pH, pH, W // pW, pW).permute(1, 3, 2, 4, 0).flatten(2).flatten(0, 1)
+            flat_x.append(img)
+        x = flat_x
+        padded_img_embed = torch.zeros(bsz, max_img_len, x[0].shape[-1], device=device, dtype=x[0].dtype)
+        padded_img_mask = torch.zeros(bsz, max_img_len, dtype=torch.bool, device=device)
+        for i in range(bsz):
+            padded_img_embed[i, :l_effective_img_len[i]] = x[i]
+            padded_img_mask[i, :l_effective_img_len[i]] = True
+
+        padded_img_embed = self.x_embedder(padded_img_embed)
+        for layer in self.noise_refiner:
+            padded_img_embed = layer(padded_img_embed, padded_img_mask, img_freqs_cis, t)
+
+        mask = torch.zeros(bsz, max_seq_len, dtype=torch.bool, device=device)
+        padded_full_embed = torch.zeros(bsz, max_seq_len, self.dim, device=device, dtype=x[0].dtype)
+        for i in range(bsz):
+            cap_len = l_effective_cap_len[i]
+            img_len = l_effective_img_len[i]
+
+            mask[i, :cap_len+img_len] = True
+            padded_full_embed[i, :cap_len] = cap_feats[i, :cap_len]
+            padded_full_embed[i, cap_len:cap_len+img_len] = padded_img_embed[i, :img_len]
+
+        return padded_full_embed, mask, img_sizes, l_effective_cap_len, freqs_cis
 
 
 class TransformerLayer(nn.Module):
