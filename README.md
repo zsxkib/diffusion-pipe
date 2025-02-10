@@ -18,6 +18,8 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo, Cosmos, Lumina Image 2.0
 - Easily add support for new models by implementing a single subclass
 
 ## Recent changes
+- 2025-02-10
+  - Fixed a bug in video training causing width and height to be flipped when bucketing by aspect ratio. This would cause videos to be over-cropped. Image-only training is unaffected. If you have been training on videos, please pull the latest code, and regenerate the cache using the --regenerate_cache flag, or delete the cache dir inside the dataset directories.
 - 2025-02-09
   - Add support for Lumina Image 2.0. Both LoRA and full fine tuning are supported.
 - 2025-02-08

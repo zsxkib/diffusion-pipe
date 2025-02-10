@@ -384,7 +384,8 @@ class DirectoryDataset:
                     # TODO: this is an estimate of frame count. What happens if variable frame rate? Is
                     # it still close enough?
                     meta = imageio.v3.immeta(image_file)
-                    height, width = meta['size']
+                    first_frame = next(imageio.v3.imiter(image_file))
+                    height, width = first_frame.shape[:2]
                     assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
                     frames = int(self.framerate * meta['duration'])
                 else:
