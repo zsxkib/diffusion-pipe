@@ -220,10 +220,12 @@ class ARBucketDataset:
 
 
 class DirectoryDataset:
-    def __init__(self, directory_config, dataset_config, model_name, framerate=None):
+    def __init__(self, directory_config, dataset_config, model_name, framerate=None, skip_dataset_validation=False):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         self.dataset_config = dataset_config
+        if not skip_dataset_validation:
+            self.validate()
         self.model_name = model_name
         self.framerate = framerate
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
@@ -262,6 +264,15 @@ class DirectoryDataset:
             frame_buckets.append(1)
         frame_buckets.sort()
         self.frame_buckets = np.array(frame_buckets)
+
+    def validate(self):
+        resolutions = self.directory_config.get('resolutions', self.dataset_config.get('resolutions', []))
+        if len(resolutions) > 3:
+            if is_main_process():
+                print('WARNING: You have set a lot of resolutions in the dataset config. Please read the comments in the example dataset.toml file,'
+                      ' and make sure you understand what this setting does. If you still want to proceed with the current configuration,'
+                      ' run the script with the --i_know_what_i_am_doing flag.')
+            quit()
 
     def cache_metadata(self, regenerate_cache=False):
         files = list(self.path.glob('*'))
@@ -338,7 +349,6 @@ class DirectoryDataset:
 
     def _set_defaults(self, directory_config, dataset_config):
         directory_config.setdefault('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
-        directory_config.setdefault('resolutions', dataset_config.get('resolutions', None))
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
 
@@ -485,19 +495,25 @@ class DirectoryDataset:
 # for returning the correct batch for the process's data parallel rank. Calls model.prepare_inputs so the
 # returned tuple of tensors is whatever the model needs.
 class Dataset:
-    def __init__(self, dataset_config, model, skip_dataset_override=False):
+    def __init__(self, dataset_config, model, skip_dataset_validation=False):
         super().__init__()
         self.dataset_config = dataset_config
         self.model = model
         self.model_name = self.model.name
         self.post_init_called = False
         self.eval_quantile = None
-        if not skip_dataset_override:
-            self.model.model_specific_dataset_config_override(self.dataset_config)
+        if not skip_dataset_validation:
+            self.model.model_specific_dataset_config_validation(self.dataset_config)
 
         self.directory_datasets = []
         for directory_config in dataset_config['directory']:
-            directory_dataset = DirectoryDataset(directory_config, dataset_config, self.model_name, framerate=model.framerate)
+            directory_dataset = DirectoryDataset(
+                directory_config,
+                dataset_config,
+                self.model_name,
+                framerate=model.framerate,
+                skip_dataset_validation=skip_dataset_validation,
+            )
             self.directory_datasets.append(directory_dataset)
 
     def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps):

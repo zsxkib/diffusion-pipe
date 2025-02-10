@@ -196,5 +196,5 @@ class BasePipeline:
     def to_layers(self):
         raise NotImplementedError()
 
-    def model_specific_dataset_config_override(self, dataset_config):
+    def model_specific_dataset_config_validation(self, dataset_config):
         pass

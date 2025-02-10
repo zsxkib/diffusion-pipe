@@ -25,6 +25,11 @@ SUPPORTED_SIZE_BUCKETS = [
     [704, 960, 1],
     [1280, 704, 1],
     [704, 1280, 1],
+    [960, 960, 121],
+    [960, 704, 121],
+    [704, 960, 121],
+    [1280, 704, 121],
+    [704, 1280, 121],
 ]
 
 
@@ -114,21 +119,16 @@ def vae_encode(tensor, vae):
     return vae.encode(tensor.to(p.device, p.dtype))
 
 
-def override_dataset_config(config):
-    log_warning = False
+def dataset_config_validation(config):
     if 'min_ar' in config or 'max_ar' in config or 'num_ar_buckets' in config or 'resolutions' in config:
-        config.pop('min_ar', None)
-        config.pop('max_ar', None)
-        config.pop('num_ar_buckets', None)
-        config.pop('resolutions', None)
-        config['size_buckets'] = SUPPORTED_SIZE_BUCKETS
-        log_warning = True
-    for size_bucket in config.get('size_buckets', []):
+        return False
+    size_buckets = config.get('size_buckets', [])
+    if len(size_buckets) == 0:
+        return False
+    for size_bucket in size_buckets:
         if size_bucket not in SUPPORTED_SIZE_BUCKETS:
-            config['size_buckets'] = SUPPORTED_SIZE_BUCKETS
-            log_warning = True
-            break
-    return log_warning
+            return False
+    return True
 
 
 class CosmosPipeline(BasePipeline):
@@ -171,16 +171,17 @@ class CosmosPipeline(BasePipeline):
         assert len(missing_keys) == 0
         self.transformer = self.model.net
 
-    def model_specific_dataset_config_override(self, dataset_config):
-        log_warning = False
-        log_warning |= override_dataset_config(dataset_config)
+    def model_specific_dataset_config_validation(self, dataset_config):
+        passes_validation = True
+        passes_validation &= dataset_config_validation(dataset_config)
         for directory_config in dataset_config['directory']:
-            log_warning |= override_dataset_config(directory_config)
-        if log_warning and is_main_process():
-            print('WARNING: Cosmos supports a limited set of resolutions. Anything else will likely not work correctly.'
-                  ' Overriding the dataset config to the supported configuration. You can disable this override by using the --i_know_what_i_am_doing flag.')
-            print('New dataset config:')
-            pprint(dataset_config)
+            passes_validation &= dataset_config_validation(directory_config)
+        if not passes_validation:
+            if is_main_process():
+                print('WARNING: Cosmos supports a limited set of resolutions. Anything else will likely not work correctly.'
+                      ' See the cosmos_dataset.toml example. If you still want to proceed with the current configuration,'
+                      ' run the script with the --i_know_what_i_am_doing flag.')
+            quit()
 
     def get_vae(self):
         return self.vae
