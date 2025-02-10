@@ -217,6 +217,9 @@ if __name__ == '__main__':
     elif model_type == 'cosmos':
         from models import cosmos
         model = cosmos.CosmosPipeline(config)
+    elif model_type == 'lumina_2':
+        from models import lumina_2
+        model = lumina_2.Lumina2Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -231,10 +234,12 @@ if __name__ == '__main__':
 
     with open(config['dataset']) as f:
         dataset_config = toml.load(f)
+    gradient_release = config['optimizer'].get('gradient_release', False)
     ds_config = {
         'train_micro_batch_size_per_gpu': config.get('micro_batch_size_per_gpu', 1),
         'gradient_accumulation_steps': config.get('gradient_accumulation_steps', 1),
-        'gradient_clipping': config.get('gradient_clipping', 1.0),
+        # Can't do gradient clipping with gradient release, since there are no grads at the end of the step anymore.
+        'gradient_clipping': 0. if gradient_release else config.get('gradient_clipping', 1.0),
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
@@ -342,7 +347,7 @@ if __name__ == '__main__':
             # As part of this, any grads that are None are set to zeros. We're doing gradient release to save memory,
             # so we have to avoid this.
             def _exec_reduce_grads(self):
-                assert self.mpu.get_data_parallel_world_size() == 1, 'Data parallel world size must be 1. Make sure pipeline_stages = num_gpus.'
+                assert self.mpu.get_data_parallel_world_size() == 1, 'When using gradient release, data parallel world size must be 1. Make sure pipeline_stages = num_gpus.'
                 return
             deepspeed.runtime.pipe.engine.PipelineEngine._INSTRUCTION_MAP[deepspeed.runtime.pipe.schedule.ReduceGrads] = _exec_reduce_grads
 

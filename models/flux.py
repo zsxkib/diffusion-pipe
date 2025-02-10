@@ -279,15 +279,25 @@ class FluxPipeline(BasePipeline):
             img_ids = img_ids.unsqueeze(0).repeat((bs, 1, 1))
         txt_ids = torch.zeros(bs, t5_embed.shape[1], 3).to(latents.device, latents.dtype)
 
-        if timestep_quantile is not None:
-            dist = torch.distributions.normal.Normal(0, 1)
-            logits_norm = dist.icdf(torch.full((bs,), timestep_quantile, device=latents.device))
-        else:
-            logits_norm = torch.randn((bs,), device=latents.device)
+        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
 
-        sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
-        logits_norm = logits_norm * sigmoid_scale
-        t = torch.sigmoid(logits_norm)
+        if timestep_sample_method == 'logit_normal':
+            dist = torch.distributions.normal.Normal(0, 1)
+        elif timestep_sample_method == 'uniform':
+            dist = torch.distributions.uniform.Uniform(0, 1)
+        else:
+            raise NotImplementedError()
+
+        if timestep_quantile is not None:
+            t = dist.icdf(torch.full((bs,), timestep_quantile, device=latents.device))
+        else:
+            t = dist.sample((bs,)).to(latents.device)
+
+        if timestep_sample_method == 'logit_normal':
+            sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
+            t = t * sigmoid_scale
+            t = torch.sigmoid(t)
+
         if shift := self.model_config.get('shift', None):
             t = (t * shift) / (1 + (shift - 1) * t)
         elif self.model_config.get('flux_shift', False):

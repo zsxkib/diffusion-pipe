@@ -1,12 +1,13 @@
 # Summary
 
-| Model         | LoRA | Full Fine Tune | fp8/quantization |
-|---------------|------|----------------|------------------|
-|SDXL           |✅    |❌              |❌                |
-|Flux           |✅    |✅              |✅                |
-|LTX-Video      |✅    |❌              |❌                |
-|HunyuanVideo   |✅    |❌              |✅                |
-|Cosmos         |✅    |❌              |❌                |
+| Model          | LoRA | Full Fine Tune | fp8/quantization |
+|----------------|------|----------------|------------------|
+|SDXL            |✅    |❌              |❌                |
+|Flux            |✅    |✅              |✅                |
+|LTX-Video       |✅    |❌              |❌                |
+|HunyuanVideo    |✅    |❌              |✅                |
+|Cosmos          |✅    |❌              |❌                |
+|Lumina Image 2.0|✅    |✅              |❌                |
 
 
 ## SDXL
@@ -80,6 +81,7 @@ HunyuanVideo LoRAs are saved in a Diffusers-style format. The keys are named acc
 ```
 [model]
 type = 'cosmos'
+# Point these paths at the ComfyUI files.
 transformer_path = '/data2/imagegen_models/cosmos/cosmos-1.0-diffusion-7b-text2world.pt'
 vae_path = '/data2/imagegen_models/cosmos/cosmos_cv8x8x8_1.0.safetensors'
 text_encoder_path = '/data2/imagegen_models/cosmos/oldt5_xxl_fp16.safetensors'
@@ -94,3 +96,31 @@ Tentative support is added for Cosmos (text2world diffusion variants). Compared 
 I will likely not be actively supporting Cosmos going forward. All the pieces are there, and if you really want to try training it you can. But don't expect me to spend time trying to fix things if something doesn't work right.
 
 Cosmos LoRAs are saved in ComfyUI format.
+
+## Lumina Image 2.0
+```
+[model]
+type = 'lumina_2'
+# Point these paths at the ComfyUI files.
+transformer_path = '/data2/imagegen_models/lumina-2-single-files/lumina_2_model_bf16.safetensors'
+llm_path = '/data2/imagegen_models/lumina-2-single-files/gemma_2_2b_fp16.safetensors'
+vae_path = '/data2/imagegen_models/lumina-2-single-files/flux_vae.safetensors'
+dtype = 'bfloat16'
+lumina_shift = true
+```
+See the [Lumina 2 example dataset config](./examples/recommended_lumina_dataset_config.toml) which shows how to add a caption prefix and contains the recommended resolution settings.
+
+In addition to LoRA, Lumina 2 supports full fine tuning. It can be fine tuned at 1024x1024 resolution on a single 24GB GPU. For FFT, delete or comment out the [adapter] block in the config. If doing FFT with 24GB VRAM, you will need to use an alternative optimizer to lower VRAM use:
+```
+[optimizer]
+type = 'adamw8bitkahan'
+lr = 5e-6
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
+gradient_release = true
+```
+
+This uses a custom AdamW8bit optimizer with Kahan summation (required for proper bf16 training), and it enables an experimental gradient release for more VRAM saving. If you are training only at 512 resolution, you can remove the gradient release part. If you have a >24GB GPU, or multiple GPUs and use pipeline parallelism, you can perhaps just use the normal adamw_optimi optimizer type.
+
+Lumina 2 LoRAs are saved in ComfyUI format.
