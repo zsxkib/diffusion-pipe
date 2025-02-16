@@ -20,6 +20,7 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo, Cosmos, Lumina Image 2.0
 ## Recent changes
 - 2025-02-16
   - SDXL supports separate learning rates for unet and text encoders. These are specified in the [model] table. See the supported models doc for details.
+  - Added full fine tuning support for SDXL.
 - 2025-02-10
   - Fixed a bug in video training causing width and height to be flipped when bucketing by aspect ratio. This would cause videos to be over-cropped. Image-only training is unaffected. If you have been training on videos, please pull the latest code, and regenerate the cache using the --regenerate_cache flag, or delete the cache dir inside the dataset directories.
 - 2025-02-09

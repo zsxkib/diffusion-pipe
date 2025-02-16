@@ -714,7 +714,11 @@ class DatasetManager:
         # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
         # TODO: check if this is actually freeing memory.
         for model in self.submodels:
-            model.to('meta')
+            if self.model.name == 'sdxl' and model is self.vae:
+                # If full fine tuning SDXL, we need to keep the VAE weights around for saving the model.
+                model.to('cpu')
+            else:
+                model.to('meta')
 
         dist.barrier()
         if is_main_process():

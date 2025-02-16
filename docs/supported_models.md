@@ -2,7 +2,7 @@
 
 | Model          | LoRA | Full Fine Tune | fp8/quantization |
 |----------------|------|----------------|------------------|
-|SDXL            |✅    |❌              |❌                |
+|SDXL            |✅    |✅              |❌                |
 |Flux            |✅    |✅              |✅                |
 |LTX-Video       |✅    |❌              |❌                |
 |HunyuanVideo    |✅    |❌              |✅                |
@@ -25,11 +25,11 @@ unet_lr = 4e-5
 text_encoder_1_lr = 2e-5
 text_encoder_2_lr = 2e-5
 ```
-Basic SDXL LoRA support is implemented. It is lacking many options present in other training scripts.
+Unlike other models, for SDXL the text embeddings are not cached, and the text encoders are trained.
 
-Unlike other models, text embeddings are not cached, and the text encoders are trained.
+SDXL can be full fine tuned. Just remove the [adapter] table in the config file. You will need 48GB VRAM. 2x24GB GPUs works with pipeline_stages=2.
 
-SDXL LoRAs are saved in Kohya sd-scripts format.
+SDXL LoRAs are saved in Kohya sd-scripts format. SDXL full fine tune models are saved in the original SDXL checkpoint format.
 
 ## Flux
 ```

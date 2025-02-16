@@ -76,6 +76,7 @@ transformer_dtype = 'float8'
 # How to sample timesteps to train on. Can be logit_normal or uniform.
 timestep_sample_method = 'logit_normal'
 
+# For models that support full fine tuning, simply delete or comment out the [adapter] table to FFT.
 [adapter]
 type = 'lora'
 rank = 32
