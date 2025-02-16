@@ -198,3 +198,8 @@ class BasePipeline:
 
     def model_specific_dataset_config_validation(self, dataset_config):
         pass
+
+    # Get param groups that will be passed into the optimizer. Models can override this, e.g. SDXL
+    # supports separate learning rates for unet and text encoders.
+    def get_param_groups(self, parameters):
+        return parameters

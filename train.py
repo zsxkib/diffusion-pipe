@@ -380,7 +380,17 @@ if __name__ == '__main__':
             if 'momentum' in kwargs:
                 kwargs['momentum'] = kwargs['momentum'] ** (1/gas)
 
-            optimizer_dict = {p: klass([p], **kwargs) for p in model_parameters}
+            optimizer_dict = {}
+            for pg in model.get_param_groups(model_parameters):
+                param_kwargs = kwargs.copy()
+                if isinstance(pg, dict):
+                    # param group
+                    for p in pg['params']:
+                        param_kwargs['lr'] = pg['lr']
+                        optimizer_dict[p] = klass([p], **param_kwargs)
+                else:
+                    # param
+                    optimizer_dict[pg] = klass([pg], **param_kwargs)
 
             def optimizer_hook(p):
                 optimizer_dict[p].step()
@@ -392,6 +402,7 @@ if __name__ == '__main__':
             from optimizers import gradient_release
             return gradient_release.GradientReleaseOptimizerWrapper(list(optimizer_dict.values()))
         else:
+            model_parameters = model.get_param_groups(model_parameters)
             return klass(model_parameters, *args, **kwargs)
 
     model_engine, optimizer, _, _ = deepspeed.initialize(

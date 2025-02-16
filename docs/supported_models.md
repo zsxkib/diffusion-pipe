@@ -20,8 +20,12 @@ dtype = 'bfloat16'
 #v_pred = true
 # Min SNR is supported. Same meaning as sd-scripts
 #min_snr_gamma = 5
+# You can set separate learning rates for unet and text encoders. If one of these isn't set, the optimizer learning rate will apply.
+unet_lr = 4e-5
+text_encoder_1_lr = 2e-5
+text_encoder_2_lr = 2e-5
 ```
-Basic SDXL LoRA support is implemented. It is lacking many options present in other training scripts. For example, you currently can't set separate learning rates for text encoders and unet.
+Basic SDXL LoRA support is implemented. It is lacking many options present in other training scripts.
 
 Unlike other models, text embeddings are not cached, and the text encoders are trained.
 

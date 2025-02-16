@@ -7,7 +7,7 @@ import peft
 import safetensors
 
 from models.base import BasePipeline, make_contiguous
-from utils.common import AUTOCAST_DTYPE
+from utils.common import AUTOCAST_DTYPE, is_main_process
 
 
 # Copied from https://github.com/kohya-ss/sd-scripts/blob/main/library/custom_train_functions.py
@@ -261,6 +261,28 @@ class SDXLPipeline(BasePipeline):
             layers.append(UnetUpBlockLayer(block, is_final_block))
         layers.append(FinalLayer(unet, self))
         return layers
+
+    def get_param_groups(self, parameters):
+        unet_params, text_encoder_params, text_encoder_2_params = [], [], []
+        for p in parameters:
+            if p.original_name.startswith('unet.'):
+                unet_params.append(p)
+            elif p.original_name.startswith('text_encoder.'):
+                text_encoder_params.append(p)
+            elif p.original_name.startswith('text_encoder_2.'):
+                text_encoder_2_params.append(p)
+            else:
+                raise RuntimeError(f'Unexpected parameter: {p.original_name}')
+        base_lr = self.config['optimizer']['lr']
+        unet_lr = self.model_config.get('unet_lr', base_lr)
+        text_encoder_lr = self.model_config.get('text_encoder_1_lr', base_lr)
+        text_encoder_2_lr = self.model_config.get('text_encoder_2_lr', base_lr)
+        if is_main_process():
+            print(f'Using unet_lr={unet_lr}, text_encoder_1_lr={text_encoder_lr}, text_encoder_2_lr={text_encoder_2_lr}')
+        unet_param_group = {'params': unet_params, 'lr': unet_lr}
+        text_encoder_param_group = {'params': text_encoder_params, 'lr': text_encoder_lr}
+        text_encoder_2_param_group = {'params': text_encoder_2_params, 'lr': text_encoder_2_lr}
+        return [unet_param_group, text_encoder_param_group, text_encoder_2_param_group]
 
 
 class InitialLayer(nn.Module):
