@@ -350,9 +350,9 @@ class SDXLPipeline(BasePipeline):
     # layers that will participate in activation checkpointing
     checkpointable_layers = [
         'InitialLayer',
-        'UnetDownBlockLayer',
-        'UnetMidBlockLayer',
-        'UnetUpBlockLayer',
+        'DownBlockInnerLayer',
+        'MidBlockInnerLayer',
+        'UpBlockInnerLayer',
         'FinalLayer',
     ]
 
@@ -562,12 +562,12 @@ class SDXLPipeline(BasePipeline):
         layers = [InitialLayer(self.diffusers_pipeline)]
         unet = self.diffusers_pipeline.unet
         for block in unet.down_blocks:
-            layers.append(UnetDownBlockLayer(block))
+            layers.extend(UnetDownBlockLayer(block).to_layers())
         if unet.mid_block is not None:
-            layers.append(UnetMidBlockLayer(unet.mid_block))
+            layers.extend(UnetMidBlockLayer(unet.mid_block).to_layers())
         for i, block in enumerate(unet.up_blocks):
             is_final_block = i == len(unet.up_blocks) - 1
-            layers.append(UnetUpBlockLayer(block, is_final_block))
+            layers.extend(UnetUpBlockLayer(block, is_final_block).to_layers())
         layers.append(FinalLayer(unet, self))
         return layers
 
@@ -676,6 +676,88 @@ class InitialLayer(nn.Module):
         return make_contiguous(sample, timestep, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
 
 
+class DownBlockInnerLayer(nn.Module):
+    def __init__(self, resnet, attn, append_residual_hidden_states=True):
+        super().__init__()
+        self.resnet = resnet
+        self.attn = attn
+        self.append_residual_hidden_states = append_residual_hidden_states
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target = inputs
+        hidden_states = self.resnet(hidden_states, emb)
+        if self.attn is not None:
+            hidden_states = self.attn(hidden_states, encoder_hidden_states=encoder_hidden_states, return_dict=False)[0]
+        res_hidden_states += (hidden_states,)
+        return make_contiguous(hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target)
+
+
+class MidBlockInnerLayer(nn.Module):
+    def __init__(self, resnet, attn):
+        super().__init__()
+        self.resnet = resnet
+        self.attn = attn
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target = inputs
+        hidden_states = self.resnet(hidden_states, emb)
+        if self.attn is not None:
+            hidden_states = self.attn(hidden_states, encoder_hidden_states=encoder_hidden_states, return_dict=False)[0]
+        return make_contiguous(hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target)
+
+
+class UpBlockInnerLayer(nn.Module):
+    def __init__(self, resnet, attn):
+        super().__init__()
+        self.resnet = resnet
+        self.attn = attn
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target = inputs
+        res_tmp = res_hidden_states[-1]
+        res_hidden_states = res_hidden_states[:-1]
+        hidden_states = torch.cat([hidden_states, res_tmp], dim=1)
+        hidden_states = self.resnet(hidden_states, emb)
+        if self.attn is not None:
+            hidden_states = self.attn(hidden_states, encoder_hidden_states=encoder_hidden_states, return_dict=False)[0]
+        return make_contiguous(hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target)
+
+
+class DownsamplerLayer(nn.Module):
+    def __init__(self, downsamplers):
+        super().__init__()
+        self.downsamplers = downsamplers
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target = inputs
+        for downsampler in self.downsamplers:
+            hidden_states = downsampler(hidden_states)
+        res_hidden_states += (hidden_states,)
+        return make_contiguous(hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target)
+
+
+class UpsamplerLayer(nn.Module):
+    def __init__(self, upsamplers, is_final_block):
+        super().__init__()
+        self.upsamplers = upsamplers
+        self.is_final_block = is_final_block
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target = inputs
+        if not self.is_final_block and forward_upsample_size:
+            upsample_size = res_hidden_states[-1].shape[2:]
+        else:
+            upsample_size = None
+        for upsampler in self.upsamplers:
+            hidden_states = upsampler(hidden_states, upsample_size)
+        return make_contiguous(hidden_states, timesteps, emb, encoder_hidden_states, *res_hidden_states, forward_upsample_size, target)
+
+
 class UnetDownBlockLayer(nn.Module):
     def __init__(self, block):
         super().__init__()
@@ -697,6 +779,16 @@ class UnetDownBlockLayer(nn.Module):
         down_block_res_samples += res_samples
         return make_contiguous(sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
 
+    def to_layers(self):
+        layers = []
+        resnets = self.block.resnets
+        attentions = getattr(self.block, 'attentions', [None] * len(resnets))
+        for resnet, attention in zip(resnets, attentions):
+            layers.append(DownBlockInnerLayer(resnet, attention))
+        if self.block.downsamplers is not None:
+            layers.append(DownsamplerLayer(self.block.downsamplers))
+        return layers
+
 
 class UnetMidBlockLayer(nn.Module):
     def __init__(self, block):
@@ -717,6 +809,15 @@ class UnetMidBlockLayer(nn.Module):
             sample = self.mid_block(sample, emb)
 
         return make_contiguous(sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
+
+    def to_layers(self):
+        layers = []
+        resnets = self.block.resnets
+        attentions = self.block.attentions
+        layers.append(MidBlockInnerLayer(resnets[0], None))
+        for attn, resnet in zip(attentions, resnets[1:]):
+            layers.append(MidBlockInnerLayer(resnet, attn))
+        return layers
 
 
 class UnetUpBlockLayer(nn.Module):
@@ -756,6 +857,16 @@ class UnetUpBlockLayer(nn.Module):
             )
 
         return make_contiguous(sample, timesteps, emb, encoder_hidden_states, *down_block_res_samples, forward_upsample_size, target)
+
+    def to_layers(self):
+        layers = []
+        resnets = self.block.resnets
+        attentions = getattr(self.block, 'attentions', [None] * len(resnets))
+        for resnet, attention in zip(resnets, attentions):
+            layers.append(UpBlockInnerLayer(resnet, attention))
+        if self.block.upsamplers is not None:
+            layers.append(UpsamplerLayer(self.block.upsamplers, self.is_final_block))
+        return layers
 
 
 class FinalLayer(nn.Module):
