@@ -20,6 +20,8 @@ dtype = 'bfloat16'
 #v_pred = true
 # Min SNR is supported. Same meaning as sd-scripts
 #min_snr_gamma = 5
+# Debiased estimation loss is supported. Same meaning as sd-scripts.
+#debiased_estimation_loss = true
 # You can set separate learning rates for unet and text encoders. If one of these isn't set, the optimizer learning rate will apply.
 unet_lr = 4e-5
 text_encoder_1_lr = 2e-5

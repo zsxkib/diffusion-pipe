@@ -344,6 +344,17 @@ def apply_snr_weight(loss, timesteps, noise_scheduler, gamma, v_prediction=False
     return loss
 
 
+def apply_debiased_estimation(loss, timesteps, noise_scheduler, v_prediction=False):
+    snr_t = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])  # batch_size
+    snr_t = torch.minimum(snr_t, torch.ones_like(snr_t) * 1000)  # if timestep is 0, snr_t is inf, so limit it to 1000
+    if v_prediction:
+        weight = 1 / (snr_t + 1)
+    else:
+        weight = 1 / torch.sqrt(snr_t)
+    loss = loss * weight.to(loss.device)
+    return loss
+
+
 class SDXLPipeline(BasePipeline):
     # Unique name, used to make the cache_dir path.
     name = 'sdxl'
@@ -362,11 +373,14 @@ class SDXLPipeline(BasePipeline):
         self.model_config = self.config['model']
         self.v_pred = self.model_config.get('v_pred', False)
         self.min_snr_gamma = self.model_config.get('min_snr_gamma', None)
+        self.debiased_estimation_loss = self.model_config.get('debiased_estimation_loss', None)
 
         if self.v_pred:
             logger.info('Using v-prediction loss')
         if self.min_snr_gamma is not None:
             logger.info(f'Using min_snr_gamma={self.min_snr_gamma}')
+        if self.debiased_estimation_loss:
+            logger.info('Using debiased_estimation_loss')
 
         self.diffusers_pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(
             self.model_config['checkpoint_path'],
@@ -944,5 +958,7 @@ class FinalLayer(nn.Module):
 
         if self.pipeline.min_snr_gamma is not None:
             loss = apply_snr_weight(loss, timesteps, self.pipeline.scheduler, self.pipeline.min_snr_gamma, self.pipeline.v_pred)
+        if self.pipeline.debiased_estimation_loss is not None:
+            loss = apply_debiased_estimation(loss, timesteps, self.pipeline.scheduler, self.pipeline.v_pred)
 
         return loss.mean()
