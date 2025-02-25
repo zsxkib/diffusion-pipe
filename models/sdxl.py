@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 import diffusers
 import torch
@@ -387,8 +388,12 @@ class SDXLPipeline(BasePipeline):
         self.unet.train()
         self.text_encoder.train()
         self.text_encoder_2.train()
-        # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
-        # so store it in an attribute here. Same thing below if we're training a lora and creating lora weights.
+        self._set_param_original_name()
+
+    def __getattr__(self, name):
+        return getattr(self.diffusers_pipeline, name)
+
+    def _set_param_original_name(self):
         for state_dict_key_prefix, module in (
             ('unet.', self.unet),
             ('text_encoder.', self.text_encoder),
@@ -448,6 +453,17 @@ class SDXLPipeline(BasePipeline):
             safetensors.torch.save_file(kohya_sd, save_dir / 'lora.safetensors', metadata={'format': 'pt'})
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
+
+    def load_adapter_weights(self, adapter_path):
+        print(f'Loading adapter weights from path {adapter_path}')
+        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
+        if len(safetensors_files) == 0:
+            raise RuntimeError(f'No safetensors file found in {adapter_path}')
+        if len(safetensors_files) > 1:
+            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
+        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        self.diffusers_pipeline.load_lora_weights(adapter_state_dict, adapter_name='default')
+        self._set_param_original_name()
 
     def save_model(self, save_dir, diffusers_sd):
         unet_state_dict, text_enc_dict, text_enc_2_dict = {}, {}, {}

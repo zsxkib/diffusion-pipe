@@ -269,9 +269,14 @@ if __name__ == '__main__':
     model.load_diffusion_model()
 
     if adapter_config := config.get('adapter', None):
-        model.configure_adapter(adapter_config)
+        init_from_existing = adapter_config.get('init_from_existing', None)
+        # SDXL is special. LoRAs are saved in Kohya sd-scripts format, which is very difficult to load the state_dict into
+        # an adapter we already configured. So, for SDXL, load_adapter_weights will use a Diffusers method to create and
+        # load the adapter all at once from the sd-scripts format safetensors file.
+        if not (init_from_existing and model_type == 'sdxl'):
+            model.configure_adapter(adapter_config)
         is_adapter = True
-        if init_from_existing := adapter_config.get('init_from_existing', None):
+        if init_from_existing:
             model.load_adapter_weights(init_from_existing)
     else:
         is_adapter = False
