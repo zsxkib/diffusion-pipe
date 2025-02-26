@@ -24,3 +24,5 @@ omegaconf
 iopath
 termcolor
 hydra-core
+easydict
+ftfy

@@ -8,6 +8,7 @@
 |HunyuanVideo    |✅    |❌              |✅                |
 |Cosmos          |✅    |❌              |❌                |
 |Lumina Image 2.0|✅    |✅              |❌                |
+|Wan2.1          |✅    |❌              |✅                |
 
 
 ## SDXL
@@ -130,3 +131,18 @@ gradient_release = true
 This uses a custom AdamW8bit optimizer with Kahan summation (required for proper bf16 training), and it enables an experimental gradient release for more VRAM saving. If you are training only at 512 resolution, you can remove the gradient release part. If you have a >24GB GPU, or multiple GPUs and use pipeline parallelism, you can perhaps just use the normal adamw_optimi optimizer type.
 
 Lumina 2 LoRAs are saved in ComfyUI format.
+
+## Wan2.1
+```
+[model]
+type = 'wan'
+ckpt_path = '/data2/imagegen_models/Wan2.1-T2V-1.3B'
+dtype = 'bfloat16'
+# You can use fp8 for the transformer when training LoRA.
+#transformer_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+```
+
+Wan2.1 t2v variants are supported. Set ckpt_path to the original model checkpoint directory, e.g. [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B). The 1.3B is tested and confirmed working. I haven't tried the 14B yet. I don't know what the optimal training settings are.
+
+Wan2.1 LoRAs are saved in ComfyUI format.

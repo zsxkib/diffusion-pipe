@@ -221,8 +221,13 @@ if __name__ == '__main__':
     elif model_type == 'lumina_2':
         from models import lumina_2
         model = lumina_2.Lumina2Pipeline(config)
+    elif model_type == 'wan':
+        from models import wan
+        model = wan.WanPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
+
+    model.load_diffusion_model()
 
     # import sys, PIL
     # test_image = sys.argv[1]

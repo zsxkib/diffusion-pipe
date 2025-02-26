@@ -7,3 +7,6 @@
 [submodule "submodules/Lumina_2"]
 	path = submodules/Lumina_2
 	url = https://github.com/Alpha-VLLM/Lumina-Image-2.0
+[submodule "submodules/Wan2_1"]
+	path = submodules/Wan2_1
+	url = https://github.com/Wan-Video/Wan2.1

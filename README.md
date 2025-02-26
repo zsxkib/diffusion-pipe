@@ -1,16 +1,12 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Currently supports SDXL, Flux, LTX-Video, HunyuanVideo, Cosmos, Lumina Image 2.0.
+Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v)
 
 **Work in progress and highly experimental.** It is unstable and not well tested. Things might not work right.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
-- Full fine tune support for:
-    - Flux, Lumina Image 2.0
-- LoRA support for:
-    - SDXL, Flux, LTX-Video, HunyuanVideo, Cosmos, Lumina Image 2.0
 - Useful metrics logged to Tensorboard
 - Compute metrics on a held-out eval set, for measuring generalization
 - Training state checkpointing and resuming from checkpoint
@@ -18,6 +14,9 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo, Cosmos, Lumina Image 2.0
 - Easily add support for new models by implementing a single subclass
 
 ## Recent changes
+- 2025-02-25
+  - Support LoRA training on Wan2.1 t2v variants.
+  - SDXL: debiased estimation loss, init from existing lora, and arbitrary caption length.
 - 2025-02-16
   - SDXL supports separate learning rates for unet and text encoders. These are specified in the [model] table. See the supported models doc for details.
   - Added full fine tuning support for SDXL.
