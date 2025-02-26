@@ -19,7 +19,7 @@ from wan.modules.model import WanModel, sinusoidal_embedding_1d
 from wan import configs as wan_configs
 
 
-KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head']
+KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
 
 
 def vae_encode(tensor, vae):
@@ -129,7 +129,7 @@ class T5EncoderModel:
 class WanPipeline(BasePipeline):
     name = 'wan'
     framerate = 16
-    checkpointable_layers = ['TransformerBlock']
+    checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['WanAttentionBlock']
 
     def __init__(self, config):
@@ -161,6 +161,7 @@ class WanPipeline(BasePipeline):
         )
 
         # Same here, this isn't a nn.Module.
+        # TODO: by default the VAE is float32, and therefore so are the latents. Do we want to change that?
         self.vae = WanVAE(
             vae_pth=os.path.join(ckpt_dir, wan_config.vae_checkpoint),
             device='cpu',
@@ -236,6 +237,7 @@ class WanPipeline(BasePipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
+        # TODO: why does text_embeddings become float32 here? It's bfloat16 coming out of the text encoder.
         text_embeddings = inputs['text_embeddings']
         seq_lens = inputs['seq_lens']
 
