@@ -227,8 +227,6 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
-    model.load_diffusion_model()
-
     # import sys, PIL
     # test_image = sys.argv[1]
     # with torch.no_grad():
