@@ -82,6 +82,8 @@ class SizeBucketDataset:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
         self.num_repeats = self.directory_config['num_repeats']
+        if self.num_repeats <= 0:
+            raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
     def cache_latents(self, map_fn, regenerate_cache=False, caching_batch_size=1):
         print(f'caching latents: {self.size_bucket}')
@@ -131,7 +133,7 @@ class SizeBucketDataset:
         return ret
 
     def __len__(self):
-        return len(self.latent_dataset) * self.num_repeats
+        return int(len(self.latent_dataset) * self.num_repeats)
 
 
 # Logical concatenation of multiple SizeBucketDataset, for the same size bucket. It returns items
