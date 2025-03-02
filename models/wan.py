@@ -240,8 +240,14 @@ class WanPipeline(BasePipeline):
         # TODO: why does text_embeddings become float32 here? It's bfloat16 coming out of the text encoder.
         text_embeddings = inputs['text_embeddings']
         seq_lens = inputs['seq_lens']
+        mask = inputs['mask']
 
         bs, channels, num_frames, h, w = latents.shape
+
+        if mask is not None:
+            mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
+            mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
+            mask = mask.unsqueeze(2)  # make mask same number of dims as target
 
         timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
 
@@ -275,11 +281,8 @@ class WanPipeline(BasePipeline):
         t = t * 1000
 
         return (
-            x_t,
-            t,
-            text_embeddings,
-            seq_lens,
-            target,
+            (x_t, t, text_embeddings, seq_lens),
+            (target, mask),
         )
 
     def to_layers(self):
@@ -311,7 +314,7 @@ class InitialLayer(nn.Module):
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
 
-        x, t, context, text_seq_lens, target = inputs
+        x, t, context, text_seq_lens = inputs
         context = [emb[:length] for emb, length in zip(context, text_seq_lens)]
 
         device = self.patch_embedding.weight.device
@@ -349,7 +352,7 @@ class InitialLayer(nn.Module):
         seq_lens = seq_lens.to(x.device)
         grid_sizes = grid_sizes.to(x.device)
 
-        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context, target)
+        return make_contiguous(x, e, e0, seq_lens, grid_sizes, self.freqs, context)
 
 
 class TransformerLayer(nn.Module):
@@ -359,9 +362,9 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, e, e0, seq_lens, grid_sizes, freqs, context, target = inputs
+        x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
         x = self.block(x, e0, seq_lens, grid_sizes, freqs, context, None)
-        return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context, target)
+        return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context)
 
 
 class FinalLayer(nn.Module):
@@ -375,12 +378,7 @@ class FinalLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, e, e0, seq_lens, grid_sizes, freqs, context, target = inputs
+        x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
         x = self.head(x, e)
         x = self.unpatchify(x, grid_sizes)
-        output = torch.stack(x, dim=0)
-        with torch.autocast('cuda', enabled=False):
-            output = output.to(torch.float32)
-            target = target.to(torch.float32)
-            loss = F.mse_loss(output, target)
-        return loss
+        return torch.stack(x, dim=0)
