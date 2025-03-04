@@ -810,8 +810,8 @@ def split_batch(batch, pieces):
     # Each of features, label is a tuple of tensors.
     features, label = batch
     split_size = features[0].size(0) // pieces
-    split_features = zip(*(torch.split(tensor, split_size) for tensor in features))
-    # The tuples passed to Deepspeed need to only contain tensors. For None (e.g. mask), convert to empty tensor.
+    # The tuples passed to Deepspeed need to only contain tensors. For None (e.g. mask, or optional conditioning), convert to empty tensor.
+    split_features = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in features))
     split_label = zip(*(torch.split(tensor, split_size) if tensor is not None else [torch.tensor([])]*pieces for tensor in label))
     # Deepspeed works with a tuple of (features, labels).
     return list(zip(split_features, split_label))
