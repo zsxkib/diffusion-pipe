@@ -15,6 +15,10 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Ima
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2025-03-06
+  - Change LTX-Video saved LoRA format to ComfyUI format.
+  - Allow training more recent LTX-Video versions.
+  - Add support for the Chroma model. Highly experimental. See the supported models doc.
 - 2025-03-03
   - Added masked training support. See the comment in the example dataset config for explanation. This feature required some refactoring, I tested that each supported model is able to train, but if something suddenly breaks for you this change is the likely cause. Like most brand-new features, masked training is experimental.
   - Added Wan i2v training. It seems to work but is barely tested. See the supported models doc for details.

@@ -9,6 +9,7 @@
 |Cosmos          |✅    |❌              |❌                |
 |Lumina Image 2.0|✅    |✅              |❌                |
 |Wan2.1          |✅    |❌              |✅                |
+|Chroma          |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -152,3 +153,18 @@ Both t2v and i2v Wan2.1 variants are supported. Set ckpt_path to the original mo
 For i2v training, you **MUST** train on a dataset of only videos. The training script will crash with an error otherwise. The first frame of each video clip is used as the image conditioning, and the model is trained to predict the rest of the video. Please pay attention to the video_clip_mode setting, and understand that if not set it will default to 'single_middle'. This may not be what you want if you are expecting the very first frame of the source video to be the conditioning. Only the 14B model has an i2v variant, and it requires training on videos, so VRAM requirements are high. You will need 48GB even for fairly short frame lengths.
 
 Wan2.1 LoRAs are saved in ComfyUI format.
+
+## Chroma
+```
+[model]
+type = 'chroma'
+diffusers_path = '/data2/imagegen_models/FLUX.1-dev'
+transformer_path = '/data2/imagegen_models/chroma/chroma-unlocked-v10.safetensors'
+dtype = 'bfloat16'
+# You can optionally load the transformer in fp8 when training LoRAs.
+transformer_dtype = 'float8'
+flux_shift = true
+```
+Chroma is a model that is architecturally modifed and finetuned from Flux Schnell. The modifications are significant enough that it has its own model type. Set transformer_path to the Chroma single model file, and set diffusers_path to either Flux Dev or Schnell Diffusers folder (the Diffusers model is needed for loading the VAE and text encoder).
+
+Chroma LoRAs are saved in ComfyUI format.

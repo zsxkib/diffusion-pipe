@@ -224,6 +224,9 @@ if __name__ == '__main__':
     elif model_type == 'wan':
         from models import wan
         model = wan.WanPipeline(config)
+    elif model_type == 'chroma':
+        from models import chroma
+        model = chroma.ChromaPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
