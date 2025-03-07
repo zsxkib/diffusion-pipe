@@ -22,13 +22,12 @@ class LTXVideoPipeline(BasePipeline):
         dtype = self.model_config['dtype']
 
         diffusers_path = self.model_config['diffusers_path']
+        kwargs = {}
         if single_file_path := self.model_config.get('single_file_path', None):
             print(f'Loading transformer and VAE from {single_file_path}')
-            transformer = LTXVideoTransformer3DModel.from_single_file(single_file_path, torch_dtype=dtype)
-            vae = AutoencoderKLLTXVideo.from_single_file(single_file_path, torch_dtype=dtype)
-        else:
-            transformer, vae = None, None
-        self.diffusers_pipeline = LTXPipeline.from_pretrained(diffusers_path, transformer=transformer, vae=vae, torch_dtype=dtype)
+            kwargs['transformer'] = LTXVideoTransformer3DModel.from_single_file(single_file_path, torch_dtype=dtype)
+            kwargs['vae'] = AutoencoderKLLTXVideo.from_single_file(single_file_path, torch_dtype=dtype)
+        self.diffusers_pipeline = LTXPipeline.from_pretrained(diffusers_path, torch_dtype=dtype, **kwargs)
 
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
