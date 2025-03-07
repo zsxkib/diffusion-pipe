@@ -1,8 +1,10 @@
+import os.path
+
 import safetensors
 import torch
 from torch import nn
 import torch.nn.functional as F
-from diffusers import LTXPipeline
+from diffusers import LTXPipeline, LTXVideoTransformer3DModel, AutoencoderKLLTXVideo
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
@@ -17,9 +19,16 @@ class LTXVideoPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
-
         dtype = self.model_config['dtype']
-        self.diffusers_pipeline = LTXPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype)
+
+        diffusers_path = self.model_config['diffusers_path']
+        if single_file_path := self.model_config.get('single_file_path', None):
+            print(f'Loading transformer and VAE from {single_file_path}')
+            transformer = LTXVideoTransformer3DModel.from_single_file(single_file_path, torch_dtype=dtype)
+            vae = AutoencoderKLLTXVideo.from_single_file(single_file_path, torch_dtype=dtype)
+        else:
+            transformer, vae = None, None
+        self.diffusers_pipeline = LTXPipeline.from_pretrained(diffusers_path, transformer=transformer, vae=vae, torch_dtype=dtype)
 
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
