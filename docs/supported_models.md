@@ -62,7 +62,7 @@ diffusers_path = '/data2/imagegen_models/LTX-Video'
 dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
 ```
-LTX-Video LoRAs are saved in Diffusers format.
+LTX-Video LoRAs are saved in ComfyUI format.
 
 ## HunyuanVideo
 ```
