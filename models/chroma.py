@@ -18,7 +18,7 @@ from src.models.chroma.model import Chroma, chroma_params, modify_mask_to_attend
 from src.models.chroma.module.layers import timestep_embedding, distribute_modulations, ModulationOut
 
 
-KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'time_text_embed', 'context_embedder', 'x_embedder']
+KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'img_in', 'txt_in', 'distilled_guidance_layer', 'final_layer']
 
 
 def time_shift(mu: float, sigma: float, t: torch.Tensor):
@@ -148,7 +148,7 @@ class ChromaPipeline(BasePipeline):
         transformer.load_state_dict(load_state_dict(self.model_config['transformer_path']), assign=True)
 
         for name, p in transformer.named_parameters():
-            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION) or name.startswith('proj_out')):
+            if not any(x in name for x in KEEP_IN_HIGH_PRECISION):
                 p.data = p.data.to(transformer_dtype)
 
         self.diffusers_pipeline.transformer = transformer
