@@ -340,10 +340,24 @@ if __name__ == '__main__':
     else:  # Not resuming, use most recent (newly created) dir
         run_dir = get_most_recent_run_dir(config['output_dir'])
 
+    # Block swapping
+    if blocks_to_swap := config.get('blocks_to_swap', 0):
+        assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
+        assert 'adapter' in config, 'Block swapping only works when training LoRA'
+        # Don't automatically move to GPU, we'll do that ourselves.
+        def to(self, *args, **kwargs):
+            pass
+        deepspeed.pipe.PipelineModule.to = to
+        model.enable_block_swap(blocks_to_swap)
+
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}
     if config['activation_checkpointing']:
-        checkpoint_func = deepspeed.checkpointing.non_reentrant_checkpoint
+        # TODO: block swapping doesn't work with Deepspeed non-reentrant checkpoint, but PyTorch native one is fine. Some
+        # weights end up on CPU where they shouldn't. Why? Are we giving anything up by not using the Deepspeed implementation?
+        #checkpoint_func = deepspeed.checkpointing.non_reentrant_checkpoint
+        from functools import partial
+        checkpoint_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
         additional_pipeline_module_kwargs.update({
             'activation_checkpoint_interval': 1,
             'checkpointable_layers': model.checkpointable_layers,

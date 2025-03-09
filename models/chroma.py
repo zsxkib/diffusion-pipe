@@ -14,6 +14,7 @@ from accelerate import init_empty_weights
 
 from models.base import BasePipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, load_state_dict
+from utils.offloading import ModelOffloader
 from src.models.chroma.model import Chroma, chroma_params, modify_mask_to_attend_padding
 from src.models.chroma.module.layers import timestep_embedding, distribute_modulations, ModulationOut
 
@@ -134,6 +135,9 @@ class ChromaPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
+        self.offloader_double = None
+        self.offloader_single = None
+
         dtype = self.model_config['dtype']
         self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=None)
 
@@ -266,12 +270,45 @@ class ChromaPipeline(BasePipeline):
         transformer = self.transformer
         layers = [InitialLayer(transformer)]
         for i, block in enumerate(transformer.double_blocks):
-            layers.append(TransformerWrapper(block, i))
+            layers.append(TransformerWrapper(block, i, self.offloader_double))
         layers.append(concatenate_hidden_states)
         for i, block in enumerate(transformer.single_blocks):
-            layers.append(SingleTransformerWrapper(block, i))
+            layers.append(SingleTransformerWrapper(block, i, self.offloader_single))
         layers.append(FinalLayer(transformer))
         return layers
+
+    def enable_block_swap(self, blocks_to_swap):
+        transformer = self.transformer
+        double_blocks = transformer.double_blocks
+        single_blocks = transformer.single_blocks
+        num_double_blocks = len(double_blocks)
+        num_single_blocks = len(single_blocks)
+        double_blocks_to_swap = blocks_to_swap // 2
+        # This swaps more than blocks_to_swap total blocks. A bit odd, but the model does have twice as many
+        # single blocks as double. I'm just replicating the behavior of Musubi Tuner.
+        single_blocks_to_swap = (blocks_to_swap - double_blocks_to_swap) * 2 + 1
+
+        assert double_blocks_to_swap <= num_double_blocks - 2 and single_blocks_to_swap <= num_single_blocks - 2, (
+            f'Cannot swap more than {num_double_blocks - 2} double blocks and {num_single_blocks - 2} single blocks. '
+            f'Requested {double_blocks_to_swap} double blocks and {single_blocks_to_swap} single blocks.'
+        )
+
+        self.offloader_double = ModelOffloader(
+            'DoubleBlock', double_blocks, num_double_blocks, double_blocks_to_swap, True, torch.device('cuda')
+        )
+        self.offloader_single = ModelOffloader(
+            'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda')
+        )
+        transformer.double_blocks = None
+        transformer.single_blocks = None
+        transformer.to('cuda')
+        transformer.double_blocks = double_blocks
+        transformer.single_blocks = single_blocks
+        self.offloader_double.prepare_block_devices_before_forward(double_blocks)
+        self.offloader_single.prepare_block_devices_before_forward(single_blocks)
+        print(
+            f'Block swap enabled. Swapping {blocks_to_swap} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}.'
+        )
 
 
 class InitialLayer(nn.Module):
@@ -345,14 +382,19 @@ class InitialLayer(nn.Module):
 
 
 class TransformerWrapper(nn.Module):
-    def __init__(self, block, idx):
+    def __init__(self, block, idx, offloader):
         super().__init__()
         self.block = block
         self.idx = idx
+        self.offloader = offloader
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         img, txt, pe, mod_vectors, txt_img_mask = inputs
+
+        if self.offloader is not None:
+            self.offloader.wait_for_block(self.idx)
+
         img_mod_spec = modulation_distribute_dict[f"double_blocks.{self.idx}.img_mod.lin"]
         txt_mod_spec = modulation_distribute_dict[f"double_blocks.{self.idx}.txt_mod.lin"]
         img_mod = [
@@ -375,6 +417,10 @@ class TransformerWrapper(nn.Module):
         img, txt = self.block(
             img=img, txt=txt, pe=pe, distill_vec=double_mod, mask=txt_img_mask
         )
+
+        if self.offloader is not None:
+             self.offloader.submit_move_blocks_forward(self.idx)
+
         return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
 
 
@@ -385,14 +431,19 @@ def concatenate_hidden_states(inputs):
 
 
 class SingleTransformerWrapper(nn.Module):
-    def __init__(self, block, idx):
+    def __init__(self, block, idx, offloader):
         super().__init__()
         self.block = block
         self.idx = idx
+        self.offloader = offloader
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         img, txt, pe, mod_vectors, txt_img_mask = inputs
+
+        if self.offloader is not None:
+            self.offloader.wait_for_block(self.idx)
+
         single_mod_spec = modulation_distribute_dict[f"single_blocks.{self.idx}.modulation.lin"]
         single_mod = ModulationOut(
             shift=mod_vectors[:, single_mod_spec.shift, :],
@@ -400,6 +451,10 @@ class SingleTransformerWrapper(nn.Module):
             gate=mod_vectors[:, single_mod_spec.gate, :],
         )
         img = self.block(img, pe=pe, distill_vec=single_mod, mask=txt_img_mask)
+
+        if self.offloader is not None:
+             self.offloader.submit_move_blocks_forward(self.idx)
+
         return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
 
 

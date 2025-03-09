@@ -237,3 +237,6 @@ class BasePipeline:
                 loss = loss.mean()
             return loss
         return loss_fn
+
+    def enable_block_swap(self, blocks_to_swap):
+        raise NotImplementedError('Block swapping is not implemented for this model')

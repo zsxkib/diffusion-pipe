@@ -15,6 +15,10 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Ima
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2025-03-09
+  - Block swapping is supported for Wan, HunyuanVideo, Flux, and Chroma.
+    - Big thanks to @kohya-ss and [Musubi Tuner](https://github.com/kohya-ss/musubi-tuner) from which most of the implementation is taken.
+    - See the example hunyuan_video.toml file for how to configure.
 - 2025-03-06
   - Change LTX-Video saved LoRA format to ComfyUI format.
   - Allow training more recent LTX-Video versions.

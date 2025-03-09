@@ -11,6 +11,7 @@ from accelerate import init_empty_weights
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
+from utils.offloading import ModelOffloader
 from wan.modules.t5 import T5Encoder, T5Decoder, T5Model
 from wan.modules.tokenizers import HuggingfaceTokenizer
 from wan.modules.vae import WanVAE
@@ -143,6 +144,7 @@ class WanPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
+        self.offloader = None
         ckpt_dir = self.model_config['ckpt_path']
         dtype = self.model_config['dtype']
 
@@ -187,7 +189,6 @@ class WanPipeline(BasePipeline):
                 checkpoint_path=os.path.join(ckpt_dir, wan_config.clip_checkpoint),
                 tokenizer_path=os.path.join(ckpt_dir, wan_config.clip_tokenizer)
             )
-
 
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
@@ -325,10 +326,26 @@ class WanPipeline(BasePipeline):
     def to_layers(self):
         transformer = self.transformer
         layers = [InitialLayer(transformer)]
-        for block in transformer.blocks:
-            layers.append(TransformerLayer(block))
+        for i, block in enumerate(transformer.blocks):
+            layers.append(TransformerLayer(block, i, self.offloader))
         layers.append(FinalLayer(transformer))
         return layers
+
+    def enable_block_swap(self, blocks_to_swap):
+        transformer = self.transformer
+        blocks = transformer.blocks
+        num_blocks = len(blocks)
+        assert (
+            blocks_to_swap <= num_blocks - 2
+        ), f'Cannot swap more than {num_blocks - 2} blocks. Requested {blocks_to_swap} blocks to swap.'
+        self.offloader = ModelOffloader(
+            'TransformerBlock', blocks, num_blocks, blocks_to_swap, True, torch.device('cuda'), debug=False
+        )
+        transformer.blocks = None
+        transformer.to('cuda')
+        transformer.blocks = blocks
+        self.offloader.prepare_block_devices_before_forward(blocks)
+        print(f'Block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
 
 
 class InitialLayer(nn.Module):
@@ -408,14 +425,24 @@ class InitialLayer(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, block):
+    def __init__(self, block, block_idx, offloader):
         super().__init__()
         self.block = block
+        self.block_idx = block_idx
+        self.offloader = offloader
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
+
+        if self.offloader is not None:
+            self.offloader.wait_for_block(self.block_idx)
+
         x = self.block(x, e0, seq_lens, grid_sizes, freqs, context, None)
+
+        if self.offloader is not None:
+             self.offloader.submit_move_blocks_forward(self.block_idx)
+
         return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context)
 
 
