@@ -63,8 +63,8 @@ steps_per_print = 1
 # single_beginning: one clip starting at the beginning of the video
 # single_middle: one clip from the middle of the video (cutting off the start and end equally)
 # multiple_overlapping: extract the minimum number of clips to cover the full range of the video. They might overlap some.
-# default is single_middle
-video_clip_mode = 'single_middle'
+# default is single_beginning
+video_clip_mode = 'single_beginning'
 
 # This is how you configure HunyuanVideo. Other models will be different. See docs/supported_models.md for
 # details on the configuration and options for each model.
