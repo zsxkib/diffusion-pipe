@@ -1,0 +1,11 @@
+max_workers = 4
+size_buckets = [ [ 512, 512, 16,],]
+resolutions = [ 512,]
+cache_batch_size = 1
+frame_buckets = [ 1, 16,]
+video_clip_mode = "single_middle"
+[[directory]]
+path = "./data/wan_train_replicate"
+video_clip_length = 16
+num_repeats = 1
+
