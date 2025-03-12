@@ -204,10 +204,13 @@ if __name__ == '__main__':
 
     # Initialize distributed environment before deepspeed
     world_size, rank, local_rank = distributed_init(args)
-    
+
     # Now initialize deepspeed
     deepspeed.init_distributed()
-    
+
+    # needed for broadcasting Queue in dataset.py
+    torch.cuda.set_device(dist.get_rank())
+
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
         else config.get('resume_from_checkpoint', False)
