@@ -104,7 +104,6 @@ def download_model(model_type: str = "1.3b") -> None:
     
     print(f"✅ Model download check completed for {model_type} model(s)")
 
-
 def train(
     input_video_zip: CogPath = Input(
         description="A zip file containing video and caption data for training. The zip should contain at least one video file (e.g., mp4, mov) and optionally caption files (.txt).",
@@ -116,7 +115,7 @@ def train(
         choices=["1.3b", "14b"],
     ),
     video_clip_mode: str = Input(
-        description="How to use your video during training: 'single_beginning' (focus on the opening scene), 'single_middle' (focus on the middle portion, ignoring intro/outro), or 'multiple_overlapping' (try to learn from the entire video by using multiple segments). For most cases, 'single_middle' gives the best results since it avoids intros/outros.",
+        description="How to use your video during training: 'single_beginning' (focus on the opening scene), 'single_middle' (focus on the middle portion, ignoring intro/outro), or 'multiple_overlapping' (try to learn from the entire video by using multiple segments). For most cases, 'single_middle' gives the best results.",
         default="single_middle",
         choices=["single_beginning", "single_middle", "multiple_overlapping"],
     ),
@@ -124,9 +123,12 @@ def train(
         description="The trigger word to be associated with all videos during training. This word will help activate the LoRA when used in prompts.",
         default="TOK",
     ),
-    training_steps: int = Input(
-        description="Number of training steps. More steps generally leads to better overfitting, but takes longer.",
-        default=2000,
+    max_training_steps: int = Input(
+        description=(
+            "Total number of training steps, including warmup. For example, if max_training_steps=1000 and "
+            "warmup_steps_budget=100, then you have 1000 steps total, with the first 100 for warmup."
+        ),
+        default=1000,
         ge=10,
         le=20000,
     ),
@@ -142,11 +144,14 @@ def train(
         ge=16,
         le=256,
     ),
-    warmup_steps: int = Input(
-        description="Number of warmup steps for the learning rate scheduler. Helps stabilize early training.",
-        default=100,
-        ge=0,
-        le=1000,
+    warmup_steps_budget: int = Input(
+        description=(
+            "If not provided or set to -1, defaults to 10% of max_training_steps. These steps ramp from a lower LR to the "
+            "configured LR. They are included within max_training_steps, not added on top."
+        ),
+        default=-1,
+        ge=-1,
+        le=2000,
     ),
     weight_decay: float = Input(
         description="Weight decay for regularization. Controls overfitting - lower values allow more detailed memorization.",
@@ -155,21 +160,26 @@ def train(
         le=0.1,
     ),
     seed: int = Input(
-        description="Random seed for training reproducibility. Use 0 for a random seed.",
-        default=0,
-        ge=0,
-        le=100000,
+        description="Random seed for training reproducibility. Use -1 for a random seed.",
+        default=-1,
     ),
 ) -> TrainingOutput:
-    """Train a WAN model adapter on your video using LoRA fine-tuning."""
+    """
+    Train a WAN model adapter on your video using LoRA fine-tuning.
+    """
+
+    # If warmup_steps_budget not provided or -1, default to 10% of max_training_steps
+    if warmup_steps_budget is None or warmup_steps_budget == -1:
+        warmup_steps_budget = int(0.1 * max_training_steps)
+
     print("\n=== 🎥 WAN Video LoRA Training ===")
-    print(f"📊 Configuration:")
+    print("📊 Configuration:")
     print(f"  • Input: {input_video_zip}")
-    print(f"  • Training:")
-    print(f"    - Steps: {training_steps}")
-    print(f"    - LoRA Rank: {lora_rank}")
-    print(f"    - Learning Rate: {learning_rate}")
-    print(f"    - Warmup Steps: {warmup_steps}")
+    print(f"  • Model Type: {model_type}")
+    print(f"  • Max Training Steps: {max_training_steps}")
+    print(f"  • Warmup Steps Budget: {warmup_steps_budget}")
+    print(f"  • LoRA Rank: {lora_rank}")
+    print(f"  • Learning Rate: {learning_rate}")
     print("=====================================\n")
 
     if not input_video_zip:
@@ -192,20 +202,20 @@ def train(
     add_trigger_word_to_captions(trigger_word)
     
     # Create configuration files
-    create_dataset_toml()
+    create_dataset_toml(video_clip_mode)
     create_config_toml(
         model_type=model_type,
         video_clip_mode=video_clip_mode,
-        training_steps=training_steps,
+        training_steps=max_training_steps,
         learning_rate=learning_rate,
         lora_rank=lora_rank,
-        warmup_steps=warmup_steps,
+        warmup_steps=warmup_steps_budget,
         weight_decay=weight_decay,
         seed=seed
     )
     
-    # Run training
-    run_training()
+    # Run training - pass max_training_steps to force a hard stop
+    run_training(max_training_steps)
     
     # Archive results
     output_path = archive_results()
@@ -215,8 +225,8 @@ def train(
 
 
 def handle_seed(seed: int) -> int:
-    """Set up random seed, generating one if seed is 0."""
-    if seed <= 0:
+    """Set up random seed, generating one if seed is -1."""
+    if seed == -1:
         seed = int.from_bytes(os.urandom(2), "big")
     print(f"Using seed: {seed}")
     return seed
@@ -314,7 +324,7 @@ def extract_zip(zip_path: CogPath, input_dir: str) -> None:
     print("=====================================")
 
 
-def create_dataset_toml() -> None:
+def create_dataset_toml(video_clip_mode: str) -> None:
     """Create dataset configuration file."""
     print("\n=== 📝 Creating Dataset Configuration ===")
     
@@ -324,7 +334,7 @@ def create_dataset_toml() -> None:
         "resolutions": [512],
         "cache_batch_size": 1,
         "frame_buckets": [1, 16],
-        "video_clip_mode": "single_middle",
+        "video_clip_mode": video_clip_mode,
         "directory": [{
             "path": f"./{INPUT_DIR}/wan_train_replicate",
             "video_clip_length": 16,
@@ -352,20 +362,18 @@ def create_config_toml(
     """Create training configuration file with specified parameters."""
     print("\n=== 📝 Creating Training Configuration ===")
     
-    # Hard-coded checkpoint saving frequency
-    save_every_n_epochs = min(training_steps, 500)
-    
-    # Determine model path based on model_type
     if model_type.lower() == "1.3b":
         model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-1.3B")
-    else:  # 14b
+    else:
         model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-14B")
     
     config = {
-        "save_every_n_epochs": save_every_n_epochs,
+        "epochs": 999999,
+        "max_steps": training_steps,
+        "save_every_n_epochs": 999999,
+        "checkpoint_every_n_minutes": 1440,
         "dataset": "wan_dataset.toml",
         "output_dir": f"./{OUTPUT_DIR}",
-        "epochs": training_steps,
         "logging_steps": 10,
         "video_clip_mode": video_clip_mode,
         "general": {
@@ -377,7 +385,7 @@ def create_config_toml(
         "eval_datasets": [],
         "model": {
             "type": "wan",
-            "ckpt_path": model_path,  # Use the specific model path
+            "ckpt_path": model_path,
             "dtype": "bfloat16",
             "timestep_sample_method": "logit_normal"
         },
@@ -407,15 +415,11 @@ def create_config_toml(
         toml.dump(config, f)
     
     print(f"✅ Training configuration created: wan_train_replicate.toml")
-    print(f"  • Training Steps: {training_steps}")
-    print(f"  • Video Clip Mode: {video_clip_mode}")
-    print(f"  • Learning Rate: {learning_rate}")
-    print(f"  • LoRA Rank: {lora_rank}")
-    print(f"  • Warmup Steps: {warmup_steps}")
+    print(f"  • Hard stopping at {training_steps} steps (once train.py checks max_steps).")
     print("=====================================")
 
 
-def run_training() -> None:
+def run_training(training_steps: int) -> None:
     """Execute the training process."""
     print("\n=== 🚀 Starting WAN Training ===")
     
@@ -432,6 +436,7 @@ def run_training() -> None:
     cmd = " ".join(train_cmd)
     
     print(f"Running command: {cmd}")
+    print(f"⚠️ Training will run for exactly {training_steps} steps (via max_steps parameter)")
     
     # Execute the training command
     process = subprocess.run(cmd, shell=True, check=True)

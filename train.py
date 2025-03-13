@@ -599,6 +599,16 @@ if __name__ == '__main__':
         saver.process_step(step)
         step += 1
 
+        # Add a condition to halt if step >= max_steps
+        if "max_steps" in config and step >= config["max_steps"]:
+            if is_main_process():
+                print(f"Reached {step} steps (max_steps = {config['max_steps']}). Stopping training.")
+            saver.save_checkpoint(step)
+            saver.save_model(f'epoch{epoch}')
+            if is_main_process():
+                print("TRAINING COMPLETE!")
+            break
+
     # Save final training state checkpoint and model, unless we just saved them.
     if not checkpointed:
         saver.save_checkpoint(step)
