@@ -4,6 +4,7 @@ import random
 from collections import defaultdict
 import math
 import os
+import hashlib
 
 import numpy as np
 import torch
