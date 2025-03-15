@@ -18,7 +18,7 @@ micro_batch_size_per_gpu = 1
 pipeline_stages = 1
 # Number of micro-batches sent through the pipeline for each training step.
 # If pipeline_stages > 1, a higher GAS means better GPU utilization due to smaller pipeline bubbles (where GPUs aren't overlapping computation).
-gradient_accumulation_steps = 4
+gradient_accumulation_steps = 1
 # Grad norm clipping.
 gradient_clipping = 1.0
 # Learning rate warmup.
