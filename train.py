@@ -191,6 +191,13 @@ def distributed_init(args):
     return world_size, rank, local_rank
 
 
+def get_prodigy_d(optimizer):
+    d = 0
+    for group in optimizer.param_groups:
+        d += group['d']
+    return d / len(optimizer.param_groups)
+
+
 if __name__ == '__main__':
     apply_patches()
 
@@ -424,37 +431,39 @@ if __name__ == '__main__':
 
     def get_optimizer(model_parameters):
         optim_config = config['optimizer']
-        optim_type = optim_config['type'].lower()
+        optim_type = optim_config['type']
+        optim_type_lower = optim_type.lower()
 
         args = []
         kwargs = {k: v for k, v in optim_config.items() if k not in ['type', 'gradient_release']}
 
-        if optim_type == 'adamw':
+        if optim_type_lower == 'adamw':
             # TODO: fix this. I'm getting "fatal error: cuda_runtime.h: No such file or directory"
             # when Deepspeed tries to build the fused Adam extension.
             # klass = deepspeed.ops.adam.FusedAdam
             klass = torch.optim.AdamW
-        elif optim_type == 'adamw8bit':
+        elif optim_type_lower == 'adamw8bit':
             import bitsandbytes
             klass = bitsandbytes.optim.AdamW8bit
-        elif optim_type == 'adamw_optimi':
+        elif optim_type_lower == 'adamw_optimi':
             import optimi
             klass = optimi.AdamW
-        elif optim_type == 'stableadamw':
+        elif optim_type_lower == 'stableadamw':
             import optimi
             klass = optimi.StableAdamW
-        elif optim_type == 'sgd':
+        elif optim_type_lower == 'sgd':
             klass = torch.optim.SGD
-        elif optim_type == 'adamw8bitkahan':
+        elif optim_type_lower == 'adamw8bitkahan':
             from optimizers import adamw_8bit
             klass = adamw_8bit.AdamW8bitKahan
-        elif optim_type == 'offload':
+        elif optim_type_lower == 'offload':
             from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
             klass = CPUOffloadOptimizer
             args.append(torch.optim.AdamW)
             kwargs['fused'] = True
         else:
-            raise NotImplementedError(optim_type)
+            import pytorch_optimizer
+            klass = getattr(pytorch_optimizer, optim_type)
 
         if optim_config.get('gradient_release', False):
             # Prevent deepspeed from logging every single param group lr
@@ -614,6 +623,9 @@ if __name__ == '__main__':
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, step)
+            if optimizer.__class__.__name__ == 'Prodigy':
+                prodigy_d = get_prodigy_d(optimizer)
+                tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, step)
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'])

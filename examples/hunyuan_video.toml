@@ -103,10 +103,16 @@ weight_decay = 0.01
 eps = 1e-8
 
 # Can use this optimizer for a bit less memory usage.
-
 # [optimizer]
 # type = 'AdamW8bitKahan'
 # lr = 2e-5
 # betas = [0.9, 0.99]
 # weight_decay = 0.01
 # stabilize = false
+
+# Any optimizer not explicitly supported will be dynamically loaded from the pytorch-optimizer library.
+# [optimizer]
+# type = 'Prodigy'
+# lr = 1
+# betas = [0.9, 0.99]
+# weight_decay = 0.01
