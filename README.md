@@ -17,6 +17,7 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Ima
 ## Recent changes
 - 2025-03-16
   - Support loading any optimizer from the pytorch-optimizer library.
+  - Wan transformer and UMT5 can now be loaded from ComfyUI files. Thanks to @qiwang1996 for the PR!
 - 2025-03-09
   - Block swapping is supported for Wan, HunyuanVideo, Flux, and Chroma.
     - Big thanks to @kohya-ss and [Musubi Tuner](https://github.com/kohya-ss/musubi-tuner) from which most of the implementation is taken.
