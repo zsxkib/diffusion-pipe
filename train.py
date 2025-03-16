@@ -7,6 +7,7 @@ import time
 import random
 import json
 import inspect
+from pathlib import Path
 
 import toml
 import deepspeed
@@ -38,6 +39,7 @@ parser.add_argument('--regenerate_cache', action='store_true', default=None, hel
 parser.add_argument('--cache_only', action='store_true', default=None, help='Cache model inputs then exit.')
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', default=None, help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
+parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -323,6 +325,35 @@ if __name__ == '__main__':
     #         break
     #     count += 1
     # quit()
+
+    if args.dump_dataset:
+        # only works for flux
+        import torchvision
+        dataset_manager.cache(unload_models=False)
+        if is_main_process():
+            with torch.no_grad():
+                os.makedirs(args.dump_dataset, exist_ok=True)
+                vae = model.vae.to('cuda')
+                train_data.post_init(
+                    0,
+                    1,
+                    1,
+                    1,
+                )
+                for i, item in enumerate(train_data):
+                    latents = item['latents']
+                    latents = latents / vae.config.scaling_factor
+                    if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
+                        latents = latents + vae.config.shift_factor
+                    img = vae.decode(latents.to(vae.device, vae.dtype)).sample.to(torch.float32)
+                    img = img.squeeze(0)
+                    img = ((img + 1) / 2).clamp(0, 1)
+                    pil_img = torchvision.transforms.functional.to_pil_image(img)
+                    pil_img.save(args.dump_dataset / f'{i}.png')
+                    if i >= 100:
+                        break
+        dist.barrier()
+        quit()
 
     dataset_manager.cache()
     if args.cache_only:
