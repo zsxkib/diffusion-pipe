@@ -1,11 +1,11 @@
 epochs = 999999
-max_steps = 30
+max_steps = 1000
 save_every_n_epochs = 999999
 checkpoint_every_n_minutes = 1440
 dataset = "wan_dataset.toml"
 output_dir = "./output_wan"
 logging_steps = 10
-video_clip_mode = "single_middle"
+video_clip_mode = "single_beginning"
 pipeline_stages = 2
 eval_datasets = []
 
@@ -17,7 +17,7 @@ checkpoint_frequency = 5
 
 [model]
 type = "wan"
-ckpt_path = "./model_cache/Wan2.1-T2V-14B"
+ckpt_path = "./model_cache/Wan2.1-I2V-14B-480P"
 dtype = "bfloat16"
 timestep_sample_method = "logit_normal"
 
@@ -25,12 +25,12 @@ timestep_sample_method = "logit_normal"
 type = "adamw"
 lr = 0.0005
 betas = [ 0.9, 0.999,]
-weight_decay = 0.0002
+weight_decay = 0.0001
 eps = 1e-8
 
 [lr_scheduler]
 type = "cosine"
-warmup_steps = 3
+warmup_steps = 100
 
 [adapter]
 type = "lora"

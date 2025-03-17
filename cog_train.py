@@ -67,6 +67,7 @@ def get_available_gpu_count():
     except:
         return 0
 
+
 def determine_optimal_gpu_count(model_type, available_gpus):
     """Determine the optimal number of GPUs to use based on model size and availability."""
     # For 14B models, use multiple GPUs if available (up to 4)
@@ -76,6 +77,7 @@ def determine_optimal_gpu_count(model_type, available_gpus):
     else:
         # For 1.3B models, one GPU is usually sufficient
         return 1
+
 
 def download_weights(url: str, dest: str) -> None:
     """Download weights from URL to destination path."""
@@ -94,21 +96,27 @@ def download_weights(url: str, dest: str) -> None:
     print("[!] Download took:", time.time() - start, "seconds")
 
 
-def download_model(model_type: str = "1.3b") -> None:
-    """Download model weights based on specified model type."""
+def download_model(model_type: str = "1.3b", finetuning_type: str = "text2video") -> None:
+    """Download model weights based on specified model type and finetuning type."""
     print("\n=== 📥 Downloading WAN Model ===")
     print(f"Model type: {model_type}")
+    print(f"Finetuning type: {finetuning_type}")
     
-    if model_type.lower() == "1.3b":
-        # Download only the 1.3B T2V model
-        model_files = ["Wan2.1-T2V-1.3B.tar"]
-        print("Selected 1.3B model (smaller, faster training)")
-    elif model_type.lower() == "14b":
-        # Download only the 14B T2V model (not the I2V variants)
-        model_files = ["Wan2.1-T2V-14B.tar"]
-        print("Selected 14B model (larger, higher quality results)")
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}. Choose '1.3b' or '14b'.")
+    if finetuning_type == "image2video":
+        if model_type.lower() != "14b":
+            raise ValueError("Image to video finetuning requires the 14B model.")
+        # Download only the I2V model for image2video finetuning
+        model_files = ["Wan2.1-I2V-14B-480P.tar"]
+        print("Selected I2V-14B-480P model for image-to-video training")
+    else:  # text2video
+        if model_type.lower() == "1.3b":
+            model_files = ["Wan2.1-T2V-1.3B.tar"]
+            print("Selected 1.3B model for text-to-video training")
+        elif model_type.lower() == "14b":
+            model_files = ["Wan2.1-T2V-14B.tar"]
+            print("Selected 14B model for text-to-video training")
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}. Choose '1.3b' or '14b'.")
     
     if not os.path.exists(MODEL_CACHE):
         os.makedirs(MODEL_CACHE)
@@ -152,7 +160,11 @@ def download_model(model_type: str = "1.3b") -> None:
             print(f"Model {model_file} already exists and appears complete, skipping download")
     
     # Final verification for the main model that will be used for training
-    main_model_dir = os.path.join(MODEL_CACHE, f"Wan2.1-T2V-{model_type.upper()}")
+    if finetuning_type == "image2video":
+        main_model_dir = os.path.join(MODEL_CACHE, "Wan2.1-I2V-14B-480P")
+    else:
+        main_model_dir = os.path.join(MODEL_CACHE, f"Wan2.1-T2V-{model_type.upper()}")
+    
     if not os.path.exists(os.path.join(main_model_dir, 'config.json')):
         raise ValueError(f"Critical error: The main model at {main_model_dir} is still missing config.json after download attempts.")
     
@@ -169,6 +181,11 @@ def train(
         description="Model size to use for training. '1.3b' is faster, '14b' gives higher quality but requires more VRAM.",
         default="1.3b",
         choices=["1.3b", "14b"],
+    ),
+    finetuning_type: str = Input(
+        description="Choose training mode: 'text2video' learns to generate videos from text descriptions, 'image2video' learns to extend the first frame of a video into motion (requires 14B model).",
+        default="text2video",
+        choices=["text2video", "image2video"],
     ),
     video_clip_mode: str = Input(
         description="How to use your video during training: 'single_beginning' (focus on the opening scene), 'single_middle' (focus on the middle portion, ignoring intro/outro), or 'multiple_overlapping' (try to learn from the entire video by using multiple segments). For most cases, 'single_middle' gives the best results.",
@@ -240,6 +257,10 @@ def train(
     if warmup_steps_budget is None or warmup_steps_budget == -1:
         warmup_steps_budget = int(0.1 * max_training_steps)
     
+    # Validate model type with finetuning type
+    if finetuning_type == "image2video" and model_type != "14b":
+        raise ValueError("Image-to-video finetuning requires the 14B model. Please select model_type='14b'.")
+    
     # Auto-detect GPU count
     available_gpus = get_available_gpu_count()
     num_gpus = determine_optimal_gpu_count(model_type, available_gpus)
@@ -252,6 +273,7 @@ def train(
     print("📊 Configuration:")
     print(f"  • Input: {input_video_zip}")
     print(f"  • Model: {model_type}")
+    print(f"  • Finetuning type: {finetuning_type}")
     print(f"  • GPUs: {num_gpus}")
     print(f"  • Training:")
     print(f"    - Max Steps: {max_training_steps}")
@@ -284,7 +306,7 @@ def train(
     seed = handle_seed(seed)
     
     # Download the model with specified type
-    download_model(model_type)
+    download_model(model_type, finetuning_type)
     
     # Extract zip and set up data directory
     extract_zip(
@@ -304,6 +326,7 @@ def train(
     create_dataset_toml(video_clip_mode)
     create_config_toml(
         model_type=model_type,
+        finetuning_type=finetuning_type,
         video_clip_mode=video_clip_mode,
         training_steps=max_training_steps,
         learning_rate=learning_rate,
@@ -736,6 +759,7 @@ def create_dataset_toml(video_clip_mode: str) -> None:
 
 def create_config_toml(
     model_type: str,
+    finetuning_type: str,
     video_clip_mode: str,
     training_steps: int,
     learning_rate: float,
@@ -748,10 +772,18 @@ def create_config_toml(
     """Create training configuration file with specified parameters."""
     print("\n=== 📝 Creating Training Configuration ===")
     
-    if model_type.lower() == "1.3b":
-        model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-1.3B")
-    else:
-        model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-14B")
+    # Select the appropriate model path based on model type and finetuning type
+    if finetuning_type == "image2video":
+        if model_type.lower() != "14b":
+            raise ValueError("Image to video finetuning requires the 14B model.")
+        model_path = os.path.join(MODEL_CACHE, "Wan2.1-I2V-14B-480P")
+        print(f"Using I2V model for image-to-video training: {model_path}")
+    else:  # text2video
+        if model_type.lower() == "1.3b":
+            model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-1.3B")
+        else:
+            model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-14B")
+        print(f"Using T2V model for text-to-video training: {model_path}")
     
     # Adjust pipeline stages based on number of GPUs
     pipeline_stages = num_gpus if num_gpus > 1 else 1
@@ -892,7 +924,13 @@ def archive_results() -> str:
     # Extract model type from path
     model_path = config['model']['ckpt_path']
     model_type = "1.3b" if "1.3B" in model_path else "14b"
-    lora_filename = f"{model_type}-lora.safetensors"
+    is_i2v = "I2V" in model_path
+    
+    # Create appropriate filename based on type
+    if is_i2v:
+        lora_filename = f"{model_type}-i2v-lora.safetensors"
+    else:
+        lora_filename = f"{model_type}-lora.safetensors"
     
     # Copy and rename the safetensors file
     print(f"Copying adapter model to output structure as {lora_filename}")
