@@ -13,6 +13,7 @@ os.environ["HUGGINGFACE_HUB_CACHE"] = MODEL_CACHE
 
 import shutil
 import subprocess
+import sys
 import time
 import toml
 from pathlib import Path
@@ -20,6 +21,15 @@ from zipfile import ZipFile, is_zipfile
 from cog import BaseModel, Input, Path as CogPath  # Removed Secret import
 from typing import Optional
 import logging
+import torch
+import av
+import cv2
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+# Constants for Qwen2-VL model
+QWEN_MODEL_CACHE = "./qwen_checkpoints"
+QWEN_MODEL_URL = "https://weights.replicate.delivery/default/qwen/Qwen2-VL-7B-Instruct/model.tar"
 
 # Configure logging to suppress INFO messages
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
@@ -28,7 +38,7 @@ logging.basicConfig(level=logging.WARNING, format="%(message)s")
 loggers_to_quiet = [
     "torch", "accelerate", "transformers", "__main__", "PIL",
     "safetensors", "xformers", "datasets", "tokenizers", 
-    "diffusers", "filelock", "bitsandbytes"
+    "diffusers", "filelock", "bitsandbytes", "qwen_vl_utils"
 ]
 
 for logger_name in loggers_to_quiet:
@@ -50,6 +60,23 @@ JOB_NAME = "wan_train_replicate"
 
 BASE_URL = "https://weights.replicate.delivery/default/wan2.1/model_cache/"
 
+def get_available_gpu_count():
+    """Detect the number of available GPUs."""
+    try:
+        return torch.cuda.device_count()
+    except:
+        return 0
+
+def determine_optimal_gpu_count(model_type, available_gpus):
+    """Determine the optimal number of GPUs to use based on model size and availability."""
+    # For 14B models, use multiple GPUs if available (up to 4)
+    if model_type.lower() == "14b":
+        # Use all available GPUs up to 4 for 14B models
+        return min(available_gpus, 4)
+    else:
+        # For 1.3B models, one GPU is usually sufficient
+        return 1
+
 def download_weights(url: str, dest: str) -> None:
     """Download weights from URL to destination path."""
     start = time.time()
@@ -61,30 +88,25 @@ def download_weights(url: str, dest: str) -> None:
         
     command = ["pget", "-vf" + ("x" if ".tar" in url else ""), url, dest]
     
-    try:
-        print(f"[~] Running command: {' '.join(command)}")
-        subprocess.check_call(command, close_fds=False)
-    except subprocess.CalledProcessError as e:
-        print(
-            f"[ERROR] Failed to download weights. "
-            f"Command '{' '.join(e.cmd)}' returned non-zero exit status {e.returncode}."
-        )
-        
+    print(f"[~] Running command: {' '.join(command)}")
+    subprocess.check_call(command, close_fds=False)
+    
     print("[!] Download took:", time.time() - start, "seconds")
 
 
 def download_model(model_type: str = "1.3b") -> None:
     """Download model weights based on specified model type."""
+    print("\n=== 📥 Downloading WAN Model ===")
+    print(f"Model type: {model_type}")
+    
     if model_type.lower() == "1.3b":
         # Download only the 1.3B T2V model
         model_files = ["Wan2.1-T2V-1.3B.tar"]
+        print("Selected 1.3B model (smaller, faster training)")
     elif model_type.lower() == "14b":
-        # Download 14B models
-        model_files = [
-            "Wan2.1-T2V-14B.tar",
-            "Wan2.1-I2V-14B-720P.tar",
-            "Wan2.1-I2V-14B-480P.tar",
-        ]
+        # Download only the 14B T2V model (not the I2V variants)
+        model_files = ["Wan2.1-T2V-14B.tar"]
+        print("Selected 14B model (larger, higher quality results)")
     else:
         raise ValueError(f"Unsupported model type: {model_type}. Choose '1.3b' or '14b'.")
     
@@ -95,14 +117,48 @@ def download_model(model_type: str = "1.3b") -> None:
         url = BASE_URL + model_file
         filename = url.split("/")[-1]
         dest_path = os.path.join(MODEL_CACHE, filename)
+        extracted_dir = dest_path.replace(".tar", "")
         
-        if not os.path.exists(dest_path.replace(".tar", "")):
+        # Define required files for each model type to verify complete download
+        required_files = ['config.json']
+        
+        # Check if the extracted directory exists and has the required files
+        is_complete = os.path.exists(extracted_dir) and all(
+            os.path.exists(os.path.join(extracted_dir, req_file)) 
+            for req_file in required_files
+        )
+        
+        if not is_complete:
+            # If directory exists but is incomplete, remove it before downloading
+            if os.path.exists(extracted_dir):
+                print(f"Model {model_file} appears incomplete, cleaning up and re-downloading...")
+                shutil.rmtree(extracted_dir)
+            # Also remove the tar file if it exists but extraction was incomplete
+            if os.path.exists(dest_path):
+                print(f"Removing potentially corrupted tar file: {dest_path}")
+                os.remove(dest_path)
+                
             print(f"Downloading {model_file}...")
             download_weights(url, dest_path)
+            
+            # Verify the extraction was successful
+            if not all(os.path.exists(os.path.join(extracted_dir, req_file)) for req_file in required_files):
+                print(f"⚠️ Warning: Model {model_file} may still be incomplete after download.")
+                print(f"Missing files in {extracted_dir}:")
+                for req_file in required_files:
+                    if not os.path.exists(os.path.join(extracted_dir, req_file)):
+                        print(f"  - {req_file}")
         else:
-            print(f"Model {model_file} already exists, skipping download")
+            print(f"Model {model_file} already exists and appears complete, skipping download")
+    
+    # Final verification for the main model that will be used for training
+    main_model_dir = os.path.join(MODEL_CACHE, f"Wan2.1-T2V-{model_type.upper()}")
+    if not os.path.exists(os.path.join(main_model_dir, 'config.json')):
+        raise ValueError(f"Critical error: The main model at {main_model_dir} is still missing config.json after download attempts.")
     
     print(f"✅ Model download check completed for {model_type} model(s)")
+    print("=====================================")
+
 
 def train(
     input_video_zip: CogPath = Input(
@@ -122,6 +178,18 @@ def train(
     trigger_word: str = Input(
         description="The trigger word to be associated with all videos during training. This word will help activate the LoRA when used in prompts.",
         default="TOK",
+    ),
+    autocaption: bool = Input(
+        description="Automatically caption videos using QWEN-VL that don't have matching caption files.",
+        default=True,
+    ),
+    autocaption_prefix: str = Input(
+        description="Optional: Text you want to appear at the beginning of all your generated captions; for example, 'a video of TOK, '. You can include your trigger word in the prefix.",
+        default="",
+    ),
+    autocaption_suffix: str = Input(
+        description="Optional: Text you want to appear at the end of all your generated captions; for example, ' in the style of TOK'. You can include your trigger word in suffixes.",
+        default="",
     ),
     max_training_steps: int = Input(
         description=(
@@ -171,15 +239,38 @@ def train(
     # If warmup_steps_budget not provided or -1, default to 10% of max_training_steps
     if warmup_steps_budget is None or warmup_steps_budget == -1:
         warmup_steps_budget = int(0.1 * max_training_steps)
+    
+    # Auto-detect GPU count
+    available_gpus = get_available_gpu_count()
+    num_gpus = determine_optimal_gpu_count(model_type, available_gpus)
+    print(f"\n=== 🖥️ GPU Auto-detection ===")
+    print(f"  • Available GPUs: {available_gpus}")
+    print(f"  • Using: {num_gpus} GPU(s)")
+    print("=====================================\n")
 
     print("\n=== 🎥 WAN Video LoRA Training ===")
     print("📊 Configuration:")
     print(f"  • Input: {input_video_zip}")
-    print(f"  • Model Type: {model_type}")
-    print(f"  • Max Training Steps: {max_training_steps}")
-    print(f"  • Warmup Steps Budget: {warmup_steps_budget}")
-    print(f"  • LoRA Rank: {lora_rank}")
-    print(f"  • Learning Rate: {learning_rate}")
+    print(f"  • Model: {model_type}")
+    print(f"  • GPUs: {num_gpus}")
+    print(f"  • Training:")
+    print(f"    - Max Steps: {max_training_steps}")
+    print(f"    - Warmup Steps: {warmup_steps_budget}")
+    print(f"    - LoRA Rank: {lora_rank}")
+    print(f"    - Learning Rate: {learning_rate}")
+    print(f"    - Weight Decay: {weight_decay}")
+    print(f"    - Video Clip Mode: {video_clip_mode}")
+    if autocaption:
+        print(f"  • Auto-captioning:")
+        print(f"    - Enabled: {autocaption}")
+        print(f"    - Trigger Word: {trigger_word}")
+        if autocaption_prefix:
+            print(f"    - Prefix: {autocaption_prefix}")
+        if autocaption_suffix:
+            print(f"    - Suffix: {autocaption_suffix}")
+    else:
+        print(f"  • Auto-captioning: Disabled")
+        print(f"  • Trigger Word: {trigger_word}")
     print("=====================================\n")
 
     if not input_video_zip:
@@ -196,10 +287,18 @@ def train(
     download_model(model_type)
     
     # Extract zip and set up data directory
-    extract_zip(input_video_zip, INPUT_DIR)
+    extract_zip(
+        input_video_zip, 
+        INPUT_DIR, 
+        autocaption=autocaption,
+        trigger_word=trigger_word,
+        autocaption_prefix=autocaption_prefix,
+        autocaption_suffix=autocaption_suffix
+    )
     
-    # Add trigger word to captions
-    add_trigger_word_to_captions(trigger_word)
+    # Add trigger word to captions if not already done in autocaptioning
+    if not autocaption:
+        add_trigger_word_to_captions(trigger_word)
     
     # Create configuration files
     create_dataset_toml(video_clip_mode)
@@ -211,36 +310,57 @@ def train(
         lora_rank=lora_rank,
         warmup_steps=warmup_steps_budget,
         weight_decay=weight_decay,
-        seed=seed
+        seed=seed,
+        num_gpus=num_gpus
     )
     
     # Run training - pass max_training_steps to force a hard stop
-    run_training(max_training_steps)
+    run_training(max_training_steps, num_gpus)
     
     # Archive results
     output_path = archive_results()
     
-    # Simple output with just the weights
+    print("\n=== 🎉 Training Complete! ===")
+    print(f"  • Trained model saved to: {output_path}")
+    print(f"  • You can now use your WAN LoRA with trigger word: '{trigger_word}'")
+    print("=====================================\n")
+    
+    # Return the path to the trained weights
     return TrainingOutput(weights=CogPath(output_path))
 
 
 def handle_seed(seed: int) -> int:
     """Set up random seed, generating one if seed is -1."""
+    print("\n=== 🎲 Setting Random Seed ===")
     if seed == -1:
         seed = int.from_bytes(os.urandom(2), "big")
-    print(f"Using seed: {seed}")
+        print(f"Generated random seed: {seed}")
+    else:
+        print(f"Using provided seed: {seed}")
+    print("=====================================")
     return seed
 
 
 def clean_up() -> None:
     """Clean up existing directories before training."""
+    print("\n=== 🧹 Cleaning Up Previous Data ===")
     # Clean directories
-    for dir in [INPUT_DIR, OUTPUT_DIR]:
+    for dir in [INPUT_DIR, OUTPUT_DIR, QWEN_MODEL_CACHE]:
         if os.path.exists(dir):
+            print(f"Removing existing directory: {dir}")
             shutil.rmtree(dir)
+    print("✅ Workspace is clean")
+    print("=====================================")
 
 
-def extract_zip(zip_path: CogPath, input_dir: str) -> None:
+def extract_zip(
+    zip_path: CogPath, 
+    input_dir: str, 
+    autocaption: bool = False,
+    trigger_word: Optional[str] = None,
+    autocaption_prefix: Optional[str] = None,
+    autocaption_suffix: Optional[str] = None
+) -> None:
     """Extract training data from zip file, handling various input structures robustly."""
     print("\n=== 📦 Extracting Zip File ===")
     
@@ -275,6 +395,7 @@ def extract_zip(zip_path: CogPath, input_dir: str) -> None:
                 
             file_path = os.path.join(root, file)
             base_name = os.path.splitext(file)[0]
+            ext = os.path.splitext(file)[1].lower()
             
             # Move to the target directory with a flat structure
             dest_path = os.path.join(target_dir, file)
@@ -287,15 +408,26 @@ def extract_zip(zip_path: CogPath, input_dir: str) -> None:
             shutil.copy2(file_path, dest_path)
             
             # Track by file type
-            if file.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+            if ext.lower() in ('.mp4', '.mov', '.avi', '.mkv'):
                 video_files.add(base_name)
                 video_count += 1
-            elif file.lower().endswith('.txt'):
+            elif ext.lower() == '.txt':
                 caption_files.add(base_name)
                 text_count += 1
     
     # Clean up temporary directory
     shutil.rmtree(temp_extract_dir)
+    
+    # Handle auto-captioning if enabled
+    if autocaption and video_count > 0:
+        caption_files = autocaption_videos(
+            target_dir,
+            video_files,
+            caption_files,
+            trigger_word,
+            autocaption_prefix,
+            autocaption_suffix
+        )
     
     # Validate content
     if video_count == 0:
@@ -322,6 +454,259 @@ def extract_zip(zip_path: CogPath, input_dir: str) -> None:
     
     print(f"✅ Setup complete at {target_dir}")
     print("=====================================")
+
+
+def setup_qwen_model():
+    """Download and setup Qwen2-VL model for auto-captioning"""
+    print("\n=== 🧠 Setting Up QWEN-VL Model ===")
+    if not os.path.exists(QWEN_MODEL_CACHE):
+        print(f"Downloading Qwen2-VL model to {QWEN_MODEL_CACHE}")
+        start = time.time()
+        download_weights(QWEN_MODEL_URL, QWEN_MODEL_CACHE)
+        print(f"Download took: {time.time() - start:.2f}s")
+    else:
+        print(f"Using existing Qwen2-VL model from {QWEN_MODEL_CACHE}")
+
+    print("Loading QWEN model into GPU memory...")
+    
+    try:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            QWEN_MODEL_CACHE,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map="auto",
+        )
+        processor = AutoProcessor.from_pretrained(QWEN_MODEL_CACHE)
+        print("✅ QWEN-VL model loaded successfully")
+    except Exception as e:
+        print(f"⚠️ Error loading QWEN model with flash attention: {e}")
+        print("Trying again without flash attention...")
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            QWEN_MODEL_CACHE,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+        processor = AutoProcessor.from_pretrained(QWEN_MODEL_CACHE)
+        print("✅ QWEN-VL model loaded successfully without flash attention")
+    
+    print("=====================================")
+    return model, processor
+
+
+def autocaption_videos(
+    videos_path: str,
+    video_files: set,
+    caption_files: set,
+    trigger_word: Optional[str] = None,
+    autocaption_prefix: Optional[str] = None,
+    autocaption_suffix: Optional[str] = None,
+) -> set:
+    """Generate captions for videos that don't have matching .txt files."""
+    videos_without_captions = video_files - caption_files
+    if not videos_without_captions:
+        print("\n=== ✅ All videos already have captions ===")
+        return caption_files
+
+    print("\n=== 🤖 Auto-captioning Videos ===")
+    print(f"Found {len(videos_without_captions)} videos without captions")
+    
+    model, processor = setup_qwen_model()
+    
+    new_caption_files = caption_files.copy()
+    for i, vid_name in enumerate(videos_without_captions, 1):
+        # Try to find a video file with this base name
+        video_found = False
+        for ext in ['.mp4', '.mov', '.avi', '.mkv']:
+            video_path = os.path.join(videos_path, vid_name + ext)
+            if os.path.exists(video_path):
+                video_found = True
+                print(f"\n[{i}/{len(videos_without_captions)}] 🎥 Processing: {vid_name}{ext}")
+
+                # Use absolute path
+                abs_path = os.path.abspath(video_path)
+
+                # Build caption components
+                prefix = f"{autocaption_prefix.strip()} " if autocaption_prefix else ""
+                suffix = f" {autocaption_suffix.strip()}" if autocaption_suffix else ""
+                trigger = f"{trigger_word} " if trigger_word else ""
+
+                # First try to generate detailed prompt with video context
+                try:
+                    # Prepare messages format with customized prompt
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "video",
+                                    "video": abs_path,
+                                },
+                                {
+                                    "type": "text",
+                                    "text": "Describe this video clip in detail, focusing on the key visual elements, actions, and overall scene.",
+                                },
+                            ],
+                        }
+                    ]
+
+                    # Process input
+                    text = processor.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+
+                    image_inputs, video_inputs = process_vision_info(messages)
+                    
+                    # Check if we have video frames
+                    if not video_inputs or len(video_inputs) == 0:
+                        print("⚠️ No valid video frames extracted. Using fallback caption.")
+                        raise ValueError("No video frames extracted")
+                    
+                    inputs = processor(
+                        text=[text],
+                        videos=video_inputs,
+                        padding=True,
+                        return_tensors="pt",
+                    ).to("cuda")
+
+                    print("Generating caption...")
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=128,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
+                    )
+                    
+                    generated_ids_trimmed = [
+                        out_ids[len(in_ids):]
+                        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                    ]
+                    
+                    caption = processor.batch_decode(
+                        generated_ids_trimmed,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )[0]
+
+                    # Combine prefix, trigger, caption, and suffix
+                    final_caption = f"{prefix}{trigger}{caption.strip()}{suffix}"
+                    print("\n📝 Generated Caption:")
+                    print("--------------------")
+                    print(f"{final_caption}")
+                    print("--------------------")
+
+                except Exception as e:
+                    print(f"\n⚠️ Warning: Failed to autocaption {vid_name}{ext}")
+                    print(f"Error: {str(e)}")
+                    
+                    # Try alternate approach with still image
+                    print("Trying alternate captioning approach with still image...")
+                    final_caption = None
+                    
+                    # Extract a single frame to use as a still image
+                    cap = cv2.VideoCapture(abs_path)
+                    if cap.isOpened():
+                        # Skip to middle of video
+                        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 2)
+                        ret, frame = cap.read()
+                        if ret:
+                            # Save frame as temporary image
+                            temp_img_path = "temp_frame.jpg"
+                            cv2.imwrite(temp_img_path, frame)
+                            
+                            try:
+                                # Create message with image instead of video
+                                image_messages = [
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "image",
+                                                "image": temp_img_path,
+                                            },
+                                            {
+                                                "type": "text",
+                                                "text": "Describe this scene briefly.",
+                                            },
+                                        ],
+                                    }
+                                ]
+                                
+                                text = processor.apply_chat_template(
+                                    image_messages, tokenize=False, add_generation_prompt=True
+                                )
+                                
+                                image_inputs, _ = process_vision_info(image_messages)
+                                
+                                if image_inputs and len(image_inputs) > 0:
+                                    inputs = processor(
+                                        text=[text],
+                                        images=image_inputs,
+                                        padding=True,
+                                        return_tensors="pt",
+                                    ).to("cuda")
+                                    
+                                    generated_ids = model.generate(
+                                        **inputs,
+                                        max_new_tokens=64,
+                                        do_sample=True,
+                                        temperature=0.7,
+                                        top_p=0.9,
+                                    )
+                                    
+                                    generated_ids_trimmed = [
+                                        out_ids[len(in_ids):]
+                                        for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                                    ]
+                                    
+                                    caption = processor.batch_decode(
+                                        generated_ids_trimmed,
+                                        skip_special_tokens=True,
+                                        clean_up_tokenization_spaces=False,
+                                    )[0]
+                                    
+                                    final_caption = f"{prefix}{trigger}{caption.strip()}{suffix}"
+                                    print("\n📝 Generated Caption (from still image):")
+                                    print("--------------------")
+                                    print(f"{final_caption}")
+                                    print("--------------------")
+                            except Exception as e2:
+                                print(f"Still image captioning failed: {e2}")
+                            
+                            # Clean up temp file
+                            if os.path.exists(temp_img_path):
+                                os.remove(temp_img_path)
+                    
+                    # Use fallback caption if other methods failed
+                    if not final_caption:
+                        final_caption = f"{prefix}{trigger}A video clip named {vid_name}{suffix}"
+                        print("\n📝 Using fallback caption:")
+                        print("--------------------")
+                        print(f"{final_caption}")
+                        print("--------------------")
+
+                # Save caption
+                txt_path = os.path.join(videos_path, vid_name + ".txt")
+                with open(txt_path, "w") as f:
+                    f.write(final_caption.strip() + "\n")
+                new_caption_files.add(vid_name)
+                print(f"✅ Caption saved to: {txt_path}")
+                break  # Found a video file, no need to check other extensions
+        
+        if not video_found:
+            print(f"⚠️ Could not find video file for {vid_name}")
+
+    # Clean up QWEN model
+    print("\n=== 🧹 Cleaning Up GPU Memory ===")
+    del model
+    del processor
+    torch.cuda.empty_cache()
+
+    print(f"✨ Successfully processed {len(videos_without_captions)} videos!")
+    print("=====================================")
+
+    return new_caption_files
 
 
 def create_dataset_toml(video_clip_mode: str) -> None:
@@ -357,7 +742,8 @@ def create_config_toml(
     lora_rank: int,
     warmup_steps: int,
     weight_decay: float,
-    seed: int
+    seed: int,
+    num_gpus: int = 1
 ) -> None:
     """Create training configuration file with specified parameters."""
     print("\n=== 📝 Creating Training Configuration ===")
@@ -366,6 +752,9 @@ def create_config_toml(
         model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-1.3B")
     else:
         model_path = os.path.join(MODEL_CACHE, "Wan2.1-T2V-14B")
+    
+    # Adjust pipeline stages based on number of GPUs
+    pipeline_stages = num_gpus if num_gpus > 1 else 1
     
     config = {
         "epochs": 999999,
@@ -376,6 +765,7 @@ def create_config_toml(
         "output_dir": f"./{OUTPUT_DIR}",
         "logging_steps": 10,
         "video_clip_mode": video_clip_mode,
+        "pipeline_stages": pipeline_stages,  # Set pipeline stages to number of GPUs
         "general": {
             "train_batch_size": 1,
             "train_on_subset": True,
@@ -406,7 +796,7 @@ def create_config_toml(
         },
         "deepspeed": {
             "gradient_accumulation_steps": 1,
-            "pipeline_stages": 1,
+            "pipeline_stages": pipeline_stages,  # Set pipeline stages to number of GPUs
             "train_micro_batch_size_per_gpu": 1
         }
     }
@@ -416,10 +806,11 @@ def create_config_toml(
     
     print(f"✅ Training configuration created: wan_train_replicate.toml")
     print(f"  • Hard stopping at {training_steps} steps (once train.py checks max_steps).")
+    print(f"  • Using {pipeline_stages} pipeline stages across {num_gpus} GPUs.")
     print("=====================================")
 
 
-def run_training(training_steps: int) -> None:
+def run_training(training_steps: int, num_gpus: int = 1) -> None:
     """Execute the training process."""
     print("\n=== 🚀 Starting WAN Training ===")
     
@@ -427,7 +818,7 @@ def run_training(training_steps: int) -> None:
         "NCCL_P2P_DISABLE=1", 
         "NCCL_IB_DISABLE=1", 
         "deepspeed", 
-        "--num_gpus=1", 
+        f"--num_gpus={num_gpus}", 
         "train.py", 
         "--config", 
         "wan_train_replicate.toml"
@@ -435,8 +826,9 @@ def run_training(training_steps: int) -> None:
     
     cmd = " ".join(train_cmd)
     
-    print(f"Running command: {cmd}")
-    print(f"⚠️ Training will run for exactly {training_steps} steps (via max_steps parameter)")
+    print(f"Training model with max {training_steps} steps on {num_gpus} GPUs")
+    print(f"Command: {cmd}")
+    print("Starting training process...")
     
     # Execute the training command
     process = subprocess.run(cmd, shell=True, check=True)
@@ -462,6 +854,7 @@ def archive_results() -> str:
         raise ValueError(f"No training directories found in {OUTPUT_DIR}")
     
     latest_dir = os.path.join(OUTPUT_DIR, subdirs[-1])
+    print(f"Found training directory: {latest_dir}")
     
     # Find the latest checkpoint (epoch) directory
     epoch_dirs = [d for d in os.listdir(latest_dir) if d.startswith("epoch")]
@@ -472,6 +865,8 @@ def archive_results() -> str:
     # Get the highest epoch number
     highest_epoch = max(epoch_dirs, key=lambda x: int(x[5:]))
     adapter_dir = os.path.join(latest_dir, highest_epoch)
+    
+    print(f"Using latest checkpoint: {highest_epoch}")
     
     if not os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")):
         raise ValueError(f"No adapter model found at {adapter_dir}")
@@ -490,19 +885,30 @@ def archive_results() -> str:
     # Create all directories
     os.makedirs(captions_dir, exist_ok=True)
     
+    # Determine the model type from the config file
+    with open("wan_train_replicate.toml", "r") as f:
+        config = toml.load(f)
+    
+    # Extract model type from path
+    model_path = config['model']['ckpt_path']
+    model_type = "1.3b" if "1.3B" in model_path else "14b"
+    lora_filename = f"{model_type}-lora.safetensors"
+    
     # Copy and rename the safetensors file
+    print(f"Copying adapter model to output structure as {lora_filename}")
     shutil.copy(
         os.path.join(adapter_dir, "adapter_model.safetensors"),
-        os.path.join(example_job_dir, "lora.safetensors")
+        os.path.join(example_job_dir, lora_filename)
     )
     
     # Copy caption files
     caption_files = list(Path(INPUT_DIR).glob("wan_train_replicate/**/*.txt"))
+    print(f"Adding {len(caption_files)} caption files to archive")
     for caption_file in caption_files:
         shutil.copy(caption_file, captions_dir)
     
     # Create the tar archive using the temp structure
-    print(f"Archiving adapter outputs to {output_path}")
+    print(f"Creating final archive at {output_path}")
     os.system(f"tar -cvf {output_path} -C {temp_root} output")
     
     # Clean up temp directory after tar is created
@@ -510,9 +916,11 @@ def archive_results() -> str:
     
     # Verify the file exists
     if os.path.exists(output_path):
-        print(f"✅ Verified file exists at: {output_path}")
-        # Get file size for sanity check
-        print(f"File size: {os.path.getsize(output_path) / (1024*1024):.2f} MB")
+        file_size_mb = os.path.getsize(output_path) / (1024*1024)
+        print(f"✅ Archive created successfully")
+        print(f"  • Path: {output_path}")
+        print(f"  • Size: {file_size_mb:.2f} MB")
+        print(f"  • LoRA: {lora_filename}")
     else:
         print(f"⚠️ WARNING: Output file not found at {output_path}")
     
@@ -540,22 +948,19 @@ def add_trigger_word_to_captions(trigger_word: str) -> None:
     # Process each caption file
     modified_count = 0
     for caption_file in caption_files:
-        try:
-            with open(caption_file, 'r') as f:
-                content = f.read().strip()
+        with open(caption_file, 'r') as f:
+            content = f.read().strip()
+        
+        # Check if trigger word is already in the content
+        if trigger_word not in content:
+            # Add trigger word to the end of the content
+            modified_content = f"{content} {trigger_word}"
             
-            # Check if trigger word is already in the content
-            if trigger_word not in content:
-                # Add trigger word to the end of the content
-                modified_content = f"{content} {trigger_word}"
-                
-                # Write modified content back to file
-                with open(caption_file, 'w') as f:
-                    f.write(modified_content)
-                
-                modified_count += 1
-                print(f"Added trigger word '{trigger_word}' to the end of {os.path.basename(caption_file)}")
-        except Exception as e:
-            print(f"Error processing caption file {caption_file}: {str(e)}")
+            # Write modified content back to file
+            with open(caption_file, 'w') as f:
+                f.write(modified_content)
+            
+            modified_count += 1
+            print(f"Added trigger word '{trigger_word}' to the end of {os.path.basename(caption_file)}")
     
     print(f"Modified {modified_count} caption files to include trigger word '{trigger_word}'")
