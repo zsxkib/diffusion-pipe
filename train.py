@@ -22,7 +22,7 @@ import numpy as np
 
 from utils import dataset as dataset_util
 from utils import common
-from utils.common import is_main_process, get_rank, DTYPE_MAP
+from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
@@ -167,15 +167,19 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
         pbar.close()
 
 
-def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
+def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps, disable_block_swap):
     if len(eval_dataloaders) == 0:
         return
+    empty_cuda_cache()
+    model.prepare_block_swap_inference(disable_block_swap=disable_block_swap)
     with torch.no_grad(), isolate_rng():
         seed = get_rank()
         random.seed(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
         _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
+    empty_cuda_cache()
+    model.prepare_block_swap_training()
 
 
 def distributed_init(args):
@@ -604,8 +608,9 @@ if __name__ == '__main__':
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
+    disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
-        evaluate(model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'])
+        evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
     epoch_loss = 0
@@ -628,7 +633,7 @@ if __name__ == '__main__':
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, step)
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
-            evaluate(model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'])
+            evaluate(model, model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
         if finished_epoch:
             if is_main_process():

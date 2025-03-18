@@ -129,6 +129,7 @@ class Offloader:
         self.blocks = blocks
         self.num_blocks = num_blocks
         self.blocks_to_swap = blocks_to_swap
+        self.blocks_to_swap_tmp = None
         self.device = device
         self.debug = debug
 
@@ -209,6 +210,14 @@ class ModelOffloader(Offloader):
                     handle = block.register_full_backward_hook(hook)
                     self.remove_handles.append(handle)
 
+    def disable_block_swap(self):
+        self.blocks_to_swap_tmp = self.blocks_to_swap
+        self.blocks_to_swap = None
+
+    def enable_block_swap(self):
+        if self.blocks_to_swap_tmp is not None:
+            self.blocks_to_swap = self.blocks_to_swap_tmp
+
     def set_forward_only(self, forward_only: bool):
         self.forward_only = forward_only
 
@@ -243,18 +252,20 @@ class ModelOffloader(Offloader):
 
         return backward_hook
 
-    def prepare_block_devices_before_forward(self, blocks: list[nn.Module]):
+    def prepare_block_devices_before_forward(self):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            for block in self.blocks:
+                block.to(self.device)
             return
 
         if self.debug:
             print(f"[{self.block_type}] Prepare block devices before forward")
 
-        for b in blocks[0 : self.num_blocks - self.blocks_to_swap]:
+        for b in self.blocks[0 : self.num_blocks - self.blocks_to_swap]:
             b.to(self.device)
             weights_to_device(b, self.device)  # make sure weights are on device
 
-        for b in blocks[self.num_blocks - self.blocks_to_swap :]:
+        for b in self.blocks[self.num_blocks - self.blocks_to_swap :]:
             b.to(self.device)  # move block to device first
             weights_to_device(b, torch.device('cpu'))  # make sure weights are on cpu
 

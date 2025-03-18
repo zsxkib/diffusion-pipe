@@ -304,11 +304,31 @@ class ChromaPipeline(BasePipeline):
         transformer.to('cuda')
         transformer.double_blocks = double_blocks
         transformer.single_blocks = single_blocks
-        self.offloader_double.prepare_block_devices_before_forward(double_blocks)
-        self.offloader_single.prepare_block_devices_before_forward(single_blocks)
+        self.prepare_block_swap_training()
         print(
             f'Block swap enabled. Swapping {blocks_to_swap} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}.'
         )
+
+    def prepare_block_swap_training(self):
+        if self.offloader_double is None:
+            return
+        self.offloader_double.enable_block_swap()
+        self.offloader_double.set_forward_only(False)
+        self.offloader_double.prepare_block_devices_before_forward()
+        self.offloader_single.enable_block_swap()
+        self.offloader_single.set_forward_only(False)
+        self.offloader_single.prepare_block_devices_before_forward()
+
+    def prepare_block_swap_inference(self, disable_block_swap=False):
+        if self.offloader_double is None:
+            return
+        if disable_block_swap:
+            self.offloader_double.disable_block_swap()
+            self.offloader_single.disable_block_swap()
+        self.offloader_double.set_forward_only(True)
+        self.offloader_double.prepare_block_devices_before_forward()
+        self.offloader_single.set_forward_only(True)
+        self.offloader_single.prepare_block_devices_before_forward()
 
 
 class InitialLayer(nn.Module):

@@ -584,8 +584,23 @@ class WanPipeline(BasePipeline):
         transformer.blocks = None
         transformer.to('cuda')
         transformer.blocks = blocks
-        self.offloader.prepare_block_devices_before_forward(blocks)
+        self.prepare_block_swap_training()
         print(f'Block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
+
+    def prepare_block_swap_training(self):
+        if self.offloader is None:
+            return
+        self.offloader.enable_block_swap()
+        self.offloader.set_forward_only(False)
+        self.offloader.prepare_block_devices_before_forward()
+
+    def prepare_block_swap_inference(self, disable_block_swap=False):
+        if self.offloader is None:
+            return
+        if disable_block_swap:
+            self.offloader.disable_block_swap()
+        self.offloader.set_forward_only(True)
+        self.offloader.prepare_block_devices_before_forward()
 
 
 class InitialLayer(nn.Module):
