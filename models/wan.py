@@ -373,7 +373,7 @@ class WanPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
-        self.offloader = None
+        self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         ckpt_dir = self.model_config['ckpt_path']
         dtype = self.model_config['dtype']
 
@@ -579,7 +579,7 @@ class WanPipeline(BasePipeline):
             blocks_to_swap <= num_blocks - 2
         ), f'Cannot swap more than {num_blocks - 2} blocks. Requested {blocks_to_swap} blocks to swap.'
         self.offloader = ModelOffloader(
-            'TransformerBlock', blocks, num_blocks, blocks_to_swap, True, torch.device('cuda'), debug=False
+            'TransformerBlock', blocks, num_blocks, blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
         transformer.blocks = None
         transformer.to('cuda')
@@ -588,15 +588,11 @@ class WanPipeline(BasePipeline):
         print(f'Block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
 
     def prepare_block_swap_training(self):
-        if self.offloader is None:
-            return
         self.offloader.enable_block_swap()
         self.offloader.set_forward_only(False)
         self.offloader.prepare_block_devices_before_forward()
 
     def prepare_block_swap_inference(self, disable_block_swap=False):
-        if self.offloader is None:
-            return
         if disable_block_swap:
             self.offloader.disable_block_swap()
         self.offloader.set_forward_only(True)
@@ -688,13 +684,9 @@ class TransformerLayer(nn.Module):
     def forward(self, inputs):
         x, e, e0, seq_lens, grid_sizes, freqs, context = inputs
 
-        if self.offloader is not None:
-            self.offloader.wait_for_block(self.block_idx)
-
+        self.offloader.wait_for_block(self.block_idx)
         x = self.block(x, e0, seq_lens, grid_sizes, freqs, context, None)
-
-        if self.offloader is not None:
-             self.offloader.submit_move_blocks_forward(self.block_idx)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(x, e, e0, seq_lens, grid_sizes, freqs, context)
 

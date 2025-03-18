@@ -196,8 +196,8 @@ class HunyuanVideoPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
-        self.offloader_double = None
-        self.offloader_single = None
+        self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
         dtype = self.model_config['dtype']
 
@@ -509,10 +509,10 @@ class HunyuanVideoPipeline(BasePipeline):
         )
 
         self.offloader_double = ModelOffloader(
-            'DoubleBlock', double_blocks, num_double_blocks, double_blocks_to_swap, True, torch.device('cuda')
+            'DoubleBlock', double_blocks, num_double_blocks, double_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
         self.offloader_single = ModelOffloader(
-            'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda')
+            'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
         transformer.double_blocks = None
         transformer.single_blocks = None
@@ -525,8 +525,6 @@ class HunyuanVideoPipeline(BasePipeline):
         )
 
     def prepare_block_swap_training(self):
-        if self.offloader_double is None:
-            return
         self.offloader_double.enable_block_swap()
         self.offloader_double.set_forward_only(False)
         self.offloader_double.prepare_block_devices_before_forward()
@@ -535,8 +533,6 @@ class HunyuanVideoPipeline(BasePipeline):
         self.offloader_single.prepare_block_devices_before_forward()
 
     def prepare_block_swap_inference(self, disable_block_swap=False):
-        if self.offloader_double is None:
-            return
         if disable_block_swap:
             self.offloader_double.disable_block_swap()
             self.offloader_single.disable_block_swap()
@@ -635,13 +631,9 @@ class DoubleBlock(nn.Module):
     def forward(self, inputs):
         img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args = inputs
 
-        if self.offloader is not None:
-            self.offloader.wait_for_block(self.block_idx)
-
+        self.offloader.wait_for_block(self.block_idx)
         img, txt = self.block(img, txt, vec, cu_seqlens, cu_seqlens, max_seqlen.item(), max_seqlen.item(), (freqs_cos, freqs_sin))
-
-        if self.offloader is not None:
-             self.offloader.submit_move_blocks_forward(self.block_idx)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args)
 
@@ -663,13 +655,9 @@ class SingleBlock(nn.Module):
     def forward(self, inputs):
         x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args = inputs
 
-        if self.offloader is not None:
-            self.offloader.wait_for_block(self.block_idx)
-
+        self.offloader.wait_for_block(self.block_idx)
         x = self.block(x, vec, txt_seq_len.item(), cu_seqlens, cu_seqlens, max_seqlen.item(), max_seqlen.item(), (freqs_cos, freqs_sin))
-
-        if self.offloader is not None:
-             self.offloader.submit_move_blocks_forward(self.block_idx)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args)
 

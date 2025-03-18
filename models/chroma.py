@@ -135,8 +135,8 @@ class ChromaPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
-        self.offloader_double = None
-        self.offloader_single = None
+        self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
         dtype = self.model_config['dtype']
         self.diffusers_pipeline = diffusers.FluxPipeline.from_pretrained(self.model_config['diffusers_path'], torch_dtype=dtype, transformer=None)
@@ -294,10 +294,10 @@ class ChromaPipeline(BasePipeline):
         )
 
         self.offloader_double = ModelOffloader(
-            'DoubleBlock', double_blocks, num_double_blocks, double_blocks_to_swap, True, torch.device('cuda')
+            'DoubleBlock', double_blocks, num_double_blocks, double_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
         self.offloader_single = ModelOffloader(
-            'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda')
+            'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
         transformer.double_blocks = None
         transformer.single_blocks = None
@@ -310,8 +310,6 @@ class ChromaPipeline(BasePipeline):
         )
 
     def prepare_block_swap_training(self):
-        if self.offloader_double is None:
-            return
         self.offloader_double.enable_block_swap()
         self.offloader_double.set_forward_only(False)
         self.offloader_double.prepare_block_devices_before_forward()
@@ -320,8 +318,6 @@ class ChromaPipeline(BasePipeline):
         self.offloader_single.prepare_block_devices_before_forward()
 
     def prepare_block_swap_inference(self, disable_block_swap=False):
-        if self.offloader_double is None:
-            return
         if disable_block_swap:
             self.offloader_double.disable_block_swap()
             self.offloader_single.disable_block_swap()
@@ -412,8 +408,7 @@ class TransformerWrapper(nn.Module):
     def forward(self, inputs):
         img, txt, pe, mod_vectors, txt_img_mask = inputs
 
-        if self.offloader is not None:
-            self.offloader.wait_for_block(self.idx)
+        self.offloader.wait_for_block(self.idx)
 
         img_mod_spec = modulation_distribute_dict[f"double_blocks.{self.idx}.img_mod.lin"]
         txt_mod_spec = modulation_distribute_dict[f"double_blocks.{self.idx}.txt_mod.lin"]
@@ -438,8 +433,7 @@ class TransformerWrapper(nn.Module):
             img=img, txt=txt, pe=pe, distill_vec=double_mod, mask=txt_img_mask
         )
 
-        if self.offloader is not None:
-             self.offloader.submit_move_blocks_forward(self.idx)
+        self.offloader.submit_move_blocks_forward(self.idx)
 
         return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
 
@@ -461,8 +455,7 @@ class SingleTransformerWrapper(nn.Module):
     def forward(self, inputs):
         img, txt, pe, mod_vectors, txt_img_mask = inputs
 
-        if self.offloader is not None:
-            self.offloader.wait_for_block(self.idx)
+        self.offloader.wait_for_block(self.idx)
 
         single_mod_spec = modulation_distribute_dict[f"single_blocks.{self.idx}.modulation.lin"]
         single_mod = ModulationOut(
@@ -472,8 +465,7 @@ class SingleTransformerWrapper(nn.Module):
         )
         img = self.block(img, pe=pe, distill_vec=single_mod, mask=txt_img_mask)
 
-        if self.offloader is not None:
-             self.offloader.submit_move_blocks_forward(self.idx)
+        self.offloader.submit_move_blocks_forward(self.idx)
 
         return make_contiguous(img, txt, pe, mod_vectors, txt_img_mask)
 

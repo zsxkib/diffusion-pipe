@@ -154,8 +154,8 @@ class FluxPipeline(BasePipeline):
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
-        self.offloader_double = None
-        self.offloader_single = None
+        self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        self.offloader_double = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
         dtype = self.model_config['dtype']
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
@@ -355,10 +355,10 @@ class FluxPipeline(BasePipeline):
         )
 
         self.offloader_double = ModelOffloader(
-            'DoubleBlock', double_blocks, num_double_blocks, double_blocks_to_swap, True, torch.device('cuda')
+            'DoubleBlock', double_blocks, num_double_blocks, double_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
         self.offloader_single = ModelOffloader(
-            'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda')
+            'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
         transformer.transformer_blocks = None
         transformer.single_transformer_blocks = None
@@ -371,8 +371,6 @@ class FluxPipeline(BasePipeline):
         )
 
     def prepare_block_swap_training(self):
-        if self.offloader_double is None:
-            return
         self.offloader_double.enable_block_swap()
         self.offloader_double.set_forward_only(False)
         self.offloader_double.prepare_block_devices_before_forward()
@@ -381,8 +379,6 @@ class FluxPipeline(BasePipeline):
         self.offloader_single.prepare_block_devices_before_forward()
 
     def prepare_block_swap_inference(self, disable_block_swap=False):
-        if self.offloader_double is None:
-            return
         if disable_block_swap:
             self.offloader_double.disable_block_swap()
             self.offloader_single.disable_block_swap()
@@ -437,18 +433,14 @@ class TransformerWrapper(nn.Module):
     def forward(self, inputs):
         hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin = inputs
 
-        if self.offloader is not None:
-            self.offloader.wait_for_block(self.block_idx)
-
+        self.offloader.wait_for_block(self.block_idx)
         encoder_hidden_states, hidden_states = self.block(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             temb=temb,
             image_rotary_emb=(freqs_cos, freqs_sin),
         )
-
-        if self.offloader is not None:
-             self.offloader.submit_move_blocks_forward(self.block_idx)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin)
 
@@ -470,17 +462,13 @@ class SingleTransformerWrapper(nn.Module):
     def forward(self, inputs):
         hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin = inputs
 
-        if self.offloader is not None:
-            self.offloader.wait_for_block(self.block_idx)
-
+        self.offloader.wait_for_block(self.block_idx)
         hidden_states = self.block(
             hidden_states=hidden_states,
             temb=temb,
             image_rotary_emb=(freqs_cos, freqs_sin),
         )
-
-        if self.offloader is not None:
-             self.offloader.submit_move_blocks_forward(self.block_idx)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return make_contiguous(hidden_states, encoder_hidden_states, temb, freqs_cos, freqs_sin)
 

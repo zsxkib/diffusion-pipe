@@ -26,6 +26,7 @@ from utils.common import is_main_process, get_rank, DTYPE_MAP, empty_cuda_cache
 import utils.saver
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
+from utils.unsloth_utils import unsloth_checkpoint
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -64,6 +65,7 @@ def set_config_defaults(config):
 
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
+    config['reentrant_activation_checkpointing'] = (config['activation_checkpointing'] == 'unsloth')
     config.setdefault('warmup_steps', 0)
     if 'save_dtype' in config:
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
@@ -413,17 +415,24 @@ if __name__ == '__main__':
 
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}
-    if config['activation_checkpointing']:
-        # TODO: block swapping doesn't work with Deepspeed non-reentrant checkpoint, but PyTorch native one is fine. Some
-        # weights end up on CPU where they shouldn't. Why? Are we giving anything up by not using the Deepspeed implementation?
-        #checkpoint_func = deepspeed.checkpointing.non_reentrant_checkpoint
-        from functools import partial
-        checkpoint_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+    activation_checkpointing = config['activation_checkpointing']
+    if activation_checkpointing:
+        if activation_checkpointing == True:
+            # TODO: block swapping doesn't work with Deepspeed non-reentrant checkpoint, but PyTorch native one is fine. Some
+            # weights end up on CPU where they shouldn't. Why? Are we giving anything up by not using the Deepspeed implementation?
+            #checkpoint_func = deepspeed.checkpointing.non_reentrant_checkpoint
+            from functools import partial
+            checkpoint_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+        elif activation_checkpointing == 'unsloth':
+            checkpoint_func = unsloth_checkpoint
+        else:
+            raise NotImplementedError(f'activation_checkpointing={activation_checkpointing} is not implemented')
         additional_pipeline_module_kwargs.update({
             'activation_checkpoint_interval': 1,
             'checkpointable_layers': model.checkpointable_layers,
             'activation_checkpoint_func': checkpoint_func,
         })
+
     pipeline_model = deepspeed.pipe.PipelineModule(
         layers=layers,
         num_stages=config['pipeline_stages'],

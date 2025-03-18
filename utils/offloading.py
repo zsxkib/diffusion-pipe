@@ -194,12 +194,14 @@ class ModelOffloader(Offloader):
         blocks_to_swap: int,
         supports_backward: bool,
         device: torch.device,
+        reentrant_activation_checkpointing: bool,
         debug: bool = False,
     ):
         super().__init__(block_type, blocks, num_blocks, blocks_to_swap, device, debug)
 
         self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
+        self.reentrant_activation_checkpointing = reentrant_activation_checkpointing
 
         if self.supports_backward:
             # register backward hooks
@@ -275,11 +277,18 @@ class ModelOffloader(Offloader):
     def wait_for_block(self, block_idx: int):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
+        if self.reentrant_activation_checkpointing and torch.is_grad_enabled():
+            # Second forward pass, don't do block swapping
+            return
         self._wait_blocks_move(block_idx)
 
     def submit_move_blocks_forward(self, block_idx: int):
         # check if blocks_to_swap is enabled
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
+            return
+
+        if self.reentrant_activation_checkpointing and torch.is_grad_enabled():
+            # Second forward pass, don't do block swapping
             return
 
         # if supports_backward and backward is enabled, we swap blocks more than blocks_to_swap in backward pass
