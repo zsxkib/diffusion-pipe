@@ -51,6 +51,7 @@ save_every_n_epochs = 2
 #checkpoint_every_n_epochs = 1
 checkpoint_every_n_minutes = 120
 # Always set to true unless you have a huge amount of VRAM.
+# This can also be 'unsloth' to reduce VRAM even more, with a slight performance hit.
 activation_checkpointing = true
 # Controls how Deepspeed decides how to divide layers across GPUs. Probably don't change this.
 partition_method = 'parameters'
