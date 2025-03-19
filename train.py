@@ -27,6 +27,7 @@ import utils.saver
 from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
+from utils.pipeline import ManualPipelineModule
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -433,10 +434,14 @@ if __name__ == '__main__':
             'activation_checkpoint_func': checkpoint_func,
         })
 
-    pipeline_model = deepspeed.pipe.PipelineModule(
+    num_stages = config.get('pipeline_stages', 1)
+    partition_method=config.get('partition_method', 'parameters')
+    partition_split = config.get('partition_split',[len(layers) / num_stages])
+    pipeline_model = ManualPipelineModule(
         layers=layers,
-        num_stages=config['pipeline_stages'],
-        partition_method=config.get('partition_method', 'parameters'),
+        num_stages=num_stages,
+        partition_method=partition_method,
+        manual_partition_split=partition_split,
         loss_fn=model.get_loss_fn(),
         **additional_pipeline_module_kwargs
     )
