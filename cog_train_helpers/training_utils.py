@@ -57,6 +57,8 @@ def run_training(training_steps: int, num_gpus: int = 1, wandb_client=None) -> N
 
         # Pattern to extract loss information
         step_pattern = re.compile(r"steps: (\d+) loss: ([\d\.]+)")
+        sample_pattern = re.compile(r"Generating sample for step (\d+)")
+        save_pattern = re.compile(r"Saving model checkpoint for step (\d+)")
         
         # Initialize sample tracking
         last_sample_check = time.time()
@@ -76,8 +78,23 @@ def run_training(training_steps: int, num_gpus: int = 1, wandb_client=None) -> N
                 loss = float(step_match.group(2))
                 wandb_client.log_loss({"loss": loss}, current_step)
             
-            # Periodically check for samples
-            if wandb_client and time.time() - last_sample_check > sample_check_interval:
+            # Check if a sample is being generated (step-based detection)
+            sample_match = sample_pattern.search(line)
+            if sample_match and wandb_client:
+                sample_step = int(sample_match.group(1))
+                print(f"Detected sample generation at step {sample_step}")
+                # We'll check for new samples shortly
+                last_sample_check = 0  # Force immediate sample check
+            
+            # Check if a checkpoint is being saved (step-based detection)
+            save_match = save_pattern.search(line)
+            if save_match and wandb_client:
+                save_step = int(save_match.group(1))
+                print(f"Detected checkpoint saving at step {save_step}")
+                # We'll handle the checkpoint upload separately at the end
+            
+            # Periodically check for samples (time-based detection as backup)
+            if wandb_client and (time.time() - last_sample_check > sample_check_interval):
                 last_sample_check = time.time()
                 output_dir = os.path.join(OUTPUT_DIR, "samples")
                 
@@ -91,6 +108,7 @@ def run_training(training_steps: int, num_gpus: int = 1, wandb_client=None) -> N
                     new_samples = all_samples - seen_samples
                     if new_samples:
                         sample_paths = [Path(p) for p in sorted(new_samples)]
+                        print(f"Found {len(new_samples)} new samples to log to W&B")
                         wandb_client.log_samples(sample_paths, current_step)
                         seen_samples.update(new_samples)
         

@@ -142,16 +142,16 @@ def train(
         default=-1,
     ),
     # Hugging Face parameters
-    hf_repo_id: str = Input(
+    hf_repo_id: Optional[str] = Input(
         description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face. For example, username/wan-lora. If the given repo does not exist, a new public repo will be created.",
         default=None,
     ),
-    hf_token: Secret = Input(
+    hf_token: Optional[Secret] = Input(
         description="Hugging Face token, if you'd like to upload the trained LoRA to Hugging Face.",
         default=None,
     ),
     # Weights & Biases parameters
-    wandb_api_key: Secret = Input(
+    wandb_api_key: Optional[Secret] = Input(
         description="Weights and Biases API key for experiment tracking. If provided, training progress will be logged to W&B.",
         default=None,
     ),
@@ -159,17 +159,27 @@ def train(
         description="Weights and Biases project name. A new project will be created if it doesn't exist.",
         default="wan_train_replicate",
     ),
-    wandb_run: str = Input(
+    wandb_run: Optional[str] = Input(
         description="Weights and Biases run name. If not provided, a random name will be generated.",
         default=None,
     ),
-    wandb_entity: str = Input(
+    wandb_entity: Optional[str] = Input(
         description="Weights and Biases entity (username or organization). If not provided, will use your default entity.",
         default=None,
     ),
-    wandb_sample_prompts: str = Input(
+    wandb_sample_prompts: Optional[str] = Input(
         description="Newline-separated list of prompts to use for sample generation. These will be logged to W&B with your trigger word.",
         default=None,
+    ),
+    wandb_sample_interval: int = Input(
+        description="Step interval for sampling output videos to W&B",
+        default=250,
+        ge=1,
+    ),
+    wandb_save_interval: int = Input(
+        description="Step interval for saving checkpoints to W&B",
+        default=500,
+        ge=1,
     ),
 ) -> TrainingOutput:
     """
@@ -306,7 +316,9 @@ def train(
         warmup_steps=warmup_steps_budget,
         weight_decay=weight_decay,
         seed=seed,
-        num_gpus=num_gpus
+        num_gpus=num_gpus,
+        wandb_sample_interval=wandb_sample_interval if wandb_api_key else None,
+        wandb_save_interval=wandb_save_interval if wandb_api_key else None
     )
     
     # Configure W&B environment if needed
@@ -360,12 +372,13 @@ def train(
                     token=hf_token.get_secret_value()
                 )
                 
-                # Upload the folder
+                # Upload the folder, ignoring .github directories
                 api.upload_folder(
                     repo_id=hf_repo_id,
                     folder_path=job_dir,
                     repo_type="model",
-                    token=hf_token.get_secret_value()
+                    token=hf_token.get_secret_value(),
+                    ignore_patterns=".github/**"
                 )
                 
                 print(f"🎉 Model uploaded to Hugging Face: {repo_url}")

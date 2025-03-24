@@ -20,3 +20,4 @@ __pycache__
 /output_wan/*
 /output/*
 /model_cache/*
+.github

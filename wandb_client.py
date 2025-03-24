@@ -51,14 +51,44 @@ class WeightsAndBiasesClient:
             print(f"Failed to log to Weights & Biases: {e}")
 
     def log_samples(self, image_paths: Sequence[Path], step: int | None):
-        data = {
-            f"samples/{truncate(prompt)}": wandb.Image(str(path))
-            for prompt, path in zip(self.sample_prompts, image_paths)
-        }
-        try:
-            wandb.log(data=data, step=step)
-        except Exception as e:
-            print(f"Failed to log to Weights & Biases: {e}")
+        data = {}
+        
+        # If we have more paths than prompts, just log the paths without prompt annotations
+        if len(image_paths) > len(self.sample_prompts) or not self.sample_prompts:
+            for i, path in enumerate(image_paths):
+                suffix = path.suffix.lower()
+                if suffix in ['.mp4', '.avi', '.mov', '.webm']:
+                    try:
+                        data[f"video/{path.name}"] = wandb.Video(str(path))
+                    except Exception as e:
+                        print(f"Failed to log video {path}: {e}")
+                else:
+                    try:
+                        data[f"image/{path.name}"] = wandb.Image(str(path))
+                    except Exception as e:
+                        print(f"Failed to log image {path}: {e}")
+        else:
+            # Map prompts to paths
+            for prompt, path in zip(self.sample_prompts, image_paths):
+                key = f"samples/{truncate(prompt)}"
+                suffix = path.suffix.lower()
+                if suffix in ['.mp4', '.avi', '.mov', '.webm']:
+                    try:
+                        data[key] = wandb.Video(str(path))
+                    except Exception as e:
+                        print(f"Failed to log video {path} for prompt {prompt}: {e}")
+                else:
+                    try:
+                        data[key] = wandb.Image(str(path))
+                    except Exception as e:
+                        print(f"Failed to log image {path} for prompt {prompt}: {e}")
+        
+        if data:
+            try:
+                wandb.log(data=data, step=step)
+                print(f"Logged {len(data)} samples to W&B at step {step}")
+            except Exception as e:
+                print(f"Failed to log to Weights & Biases: {e}")
 
     def save_weights(self, lora_path: Path):
         try:
