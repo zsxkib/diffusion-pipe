@@ -28,7 +28,7 @@ import av
 import cv2
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
-from cog_train_helpers.gpu_utils import get_available_gpu_count, determine_optimal_gpu_count
+from cog_train_helpers.gpu_utils import get_available_gpu_count, determine_optimal_gpu_count, print_gpu_memory_usage, get_nvidia_smi_info
 from cog_train_helpers.model_utils import download_model, download_weights, setup_qwen_model
 from cog_train_helpers.data_utils import extract_zip, autocaption_videos, add_trigger_word_to_captions
 from cog_train_helpers.config_utils import create_dataset_toml, create_config_toml, handle_seed
@@ -69,7 +69,7 @@ def train(
     ),
     finetuning_type: str = Input(
         description="Choose training mode: 'text2video' learns to generate videos from text descriptions, 'image2video' learns to extend the first frame of a video into motion (requires 14B model).",
-        default="text2video",
+        default="image2video",
         choices=["text2video", "image2video"],
     ),
     video_clip_mode: str = Input(
@@ -152,6 +152,15 @@ def train(
     print(f"\n=== 🖥️ GPU Auto-detection ===")
     print(f"  • Available GPUs: {available_gpus}")
     print(f"  • Using: {num_gpus} GPU(s)")
+    
+    if torch.cuda.is_available():
+        print(f"  • CUDA Version: {torch.version.cuda}")
+        for i in range(torch.cuda.device_count()):
+            print(f"  • GPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"    - Memory: {torch.cuda.get_device_properties(i).total_memory / (1024**3):.2f} GB")
+    
+    # Get initial system GPU process info
+    get_nvidia_smi_info()
     print("=====================================\n")
 
     print("\n=== 🎥 WAN Video LoRA Training ===")
@@ -190,8 +199,18 @@ def train(
     clean_up()
     seed = handle_seed(seed)
     
+    # Print baseline GPU usage before model loading
+    print("\n=== 📊 Baseline GPU Status (Pre-Model) ===")
+    print_gpu_memory_usage()
+    get_nvidia_smi_info()
+    
     # Download the model with specified type
     download_model(model_type, finetuning_type)
+    
+    # Print GPU usage after model loading
+    print("\n=== 📊 GPU Status (Post-Model Load) ===")
+    print_gpu_memory_usage()
+    get_nvidia_smi_info()
     
     # Extract zip and set up data directory
     extract_zip(
@@ -223,7 +242,14 @@ def train(
     )
     
     # Run training - pass max_training_steps to force a hard stop
+    training_start_time = time.time()
     run_training(max_training_steps, num_gpus)
+    training_end_time = time.time()
+    training_duration = training_end_time - training_start_time
+    
+    # Calculate hours, minutes, seconds
+    hours, remainder = divmod(training_duration, 3600)
+    minutes, seconds = divmod(remainder, 60)
     
     # Archive results
     output_path = archive_results()
@@ -231,6 +257,16 @@ def train(
     print("\n=== 🎉 Training Complete! ===")
     print(f"  • Trained model saved to: {output_path}")
     print(f"  • You can now use your WAN LoRA with trigger word: '{trigger_word}'")
+    print(f"  • Training duration: {int(hours)}h {int(minutes)}m {int(seconds)}s")
+    print("=====================================\n")
+    
+    # After training completes, add a summary of what happened
+    print("\n=== 📋 Training Summary ===")
+    print(f"  • Model: {model_type}")
+    print(f"  • Finetuning Type: {finetuning_type}")
+    print(f"  • GPUs Used: {num_gpus}")
+    print(f"  • Training Steps: {max_training_steps}")
+    print(f"  • Training Duration: {int(hours)}h {int(minutes)}m {int(seconds)}s")
     print("=====================================\n")
     
     # Return the path to the trained weights

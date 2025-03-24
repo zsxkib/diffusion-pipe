@@ -3,10 +3,15 @@ import os
 import shutil
 import subprocess
 import toml
+import time
+import signal
+import sys
+import threading
 from pathlib import Path
 
 # Import constants
 from cog_train_helpers.constants import INPUT_DIR, OUTPUT_DIR, QWEN_MODEL_CACHE
+from cog_train_helpers.gpu_utils import print_gpu_memory_usage, get_nvidia_smi_info
 
 def clean_up() -> None:
     """Clean up existing directories before training."""
@@ -21,7 +26,7 @@ def clean_up() -> None:
 
 
 def run_training(training_steps: int, num_gpus: int = 1) -> None:
-    """Execute the training process."""
+    """Execute the training process with periodic GPU monitoring."""
     print("\n=== 🚀 Starting WAN Training ===")
     
     train_cmd = [
@@ -40,15 +45,78 @@ def run_training(training_steps: int, num_gpus: int = 1) -> None:
     print(f"Command: {cmd}")
     print("Starting training process...")
     
-    # Execute the training command
-    process = subprocess.run(cmd, shell=True, check=True)
+    # Print initial GPU state before training starts
+    print_gpu_memory_usage()
     
-    # Verify training completed successfully
-    if process.returncode == 0:
-        print("✅ Training completed successfully!")
-    else:
-        print(f"⚠️ Training exited with code: {process.returncode}")
+    # Execute the training command as a subprocess that we can monitor
+    process = subprocess.Popen(cmd, shell=True)
     
+    # Sleep briefly to let the process start and allocate GPU resources
+    time.sleep(10)
+    
+    # Check if the process has already exited (failed to start)
+    if process.poll() is not None:
+        print(f"⚠️ Process exited immediately with code: {process.returncode}")
+        return
+    
+    # After the process starts, show the initial GPU usage with process information
+    print("\n=== 🚀 Initial Training GPU Status ===")
+    get_nvidia_smi_info()
+    
+    # Set up monitoring interval (every 100 steps, approximated by time)
+    # Estimate time per step - this is a rough estimate and can be adjusted
+    estimated_seconds_per_step = 3  # assuming ~3 seconds per step on average
+    check_interval = min(100 * estimated_seconds_per_step, 300)  # Check at least every 5 minutes
+    
+    # Monitor the GPU usage while the training is running
+    stop_monitoring = False
+    
+    def monitor_gpu_usage():
+        last_print_time = 0
+        step_counter = 0
+        while not stop_monitoring:
+            current_time = time.time()
+            if current_time - last_print_time >= check_interval:
+                step_counter += 100  # Approximate steps
+                print(f"\n=== Step ~{step_counter} GPU Monitoring ===")
+                # Use both monitoring methods
+                print_gpu_memory_usage()
+                get_nvidia_smi_info()
+                last_print_time = current_time
+            time.sleep(10)  # Check every 10 seconds if it's time to print
+    
+    # Start monitoring in a separate thread
+    monitor_thread = threading.Thread(target=monitor_gpu_usage)
+    monitor_thread.daemon = True
+    monitor_thread.start()
+    
+    try:
+        # Wait for the process to complete
+        exit_code = process.wait()
+        
+        # Stop the monitoring thread
+        stop_monitoring = True
+        monitor_thread.join(timeout=2)
+        
+        # Print final GPU state after training
+        print("\n=== 🏁 Final GPU Status After Training ===")
+        print_gpu_memory_usage()
+        get_nvidia_smi_info()
+        
+        # Check if training completed successfully
+        if exit_code == 0:
+            print("✅ Training completed successfully!")
+        else:
+            print(f"⚠️ Training exited with code: {exit_code}")
+            
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted by user")
+        process.send_signal(signal.SIGINT)
+        stop_monitoring = True
+        monitor_thread.join(timeout=2)
+        print_gpu_memory_usage()
+        get_nvidia_smi_info()
+        
     print("=====================================")
 
 
