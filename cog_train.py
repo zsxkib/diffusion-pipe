@@ -248,26 +248,20 @@ def train(
     
     # Upload to Hugging Face if requested
     if hf_repo_id and hf_token:
-        # The directory we prepared for HF upload in archive_results
         job_dir = os.path.join("output", "wan_train_replicate")
         
-        if not os.path.exists(job_dir):
-            print(f"⚠️ Training output directory not found: {job_dir}")
-        else:
-            # Find the safetensors file
+        if os.path.exists(job_dir):
+            # Find and rename safetensors file
             safetensors_files = [f for f in os.listdir(job_dir) if f.endswith('.safetensors')]
-            if not safetensors_files:
-                print("⚠️ No safetensors file found in training output.")
-            else:
-                # Rename to a standardized name
+            if safetensors_files:
                 old_lora_file = safetensors_files[0]
-                new_lora_file = handle_hf_lora_filename(trigger_word, hf_repo_id)
+                new_lora_file = handle_hf_lora_filename(trigger_word)
                 os.rename(
                     os.path.join(job_dir, old_lora_file),
                     os.path.join(job_dir, new_lora_file)
                 )
                 
-                # Create README
+                # Create README and metadata
                 handle_hf_readme(
                     hf_repo_id=hf_repo_id,
                     trigger_word=trigger_word,
@@ -276,6 +270,8 @@ def train(
                     lora_rank=lora_rank,
                     lora_filename=new_lora_file
                 )
+                
+                create_model_card_metadata(hf_repo_id, finetuning_type)
                 
                 # Upload to HF
                 print(f"Uploading to Hugging Face: {hf_repo_id}")
@@ -287,12 +283,7 @@ def train(
                     token=hf_token.get_secret_value()
                 )
                 
-                # Copy the README template to the upload directory if it exists
-                template_path = "hugging-face-readme-template.md"
-                if os.path.exists(template_path):
-                    shutil.copy(template_path, job_dir)
-                
-                # Upload the entire folder
+                # Upload the folder
                 api.upload_folder(
                     repo_id=hf_repo_id,
                     folder_path=job_dir,

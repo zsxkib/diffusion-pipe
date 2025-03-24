@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import toml
 from pathlib import Path
+import tarfile
 
 # Import constants
 from cog_train_helpers.constants import INPUT_DIR, OUTPUT_DIR, QWEN_MODEL_CACHE
@@ -53,7 +54,7 @@ def run_training(training_steps: int, num_gpus: int = 1) -> None:
 
 
 def archive_results():
-    """Archive the training results into a tar file."""
+    """Archive training results into a tar file and prepare HF upload directory."""
     print("\n=== 📦 Archiving Results ===")
     
     # Find the latest training directory
@@ -63,94 +64,50 @@ def archive_results():
         raise ValueError(f"No training directories found in {OUTPUT_DIR}")
     
     latest_dir = os.path.join(OUTPUT_DIR, training_dirs[-1])
-    print(f"Found training directory: {latest_dir}")
     
-    # Find all epoch directories
+    # Find highest epoch directory
     epoch_dirs = [d for d in os.listdir(latest_dir) if d.startswith("epoch")]
-    
-    if not epoch_dirs:
-        raise ValueError(f"No epoch directories found in {latest_dir}")
-    
-    # Get the highest epoch number
     highest_epoch = max(epoch_dirs, key=lambda x: int(x[5:]))
     adapter_dir = os.path.join(latest_dir, highest_epoch)
     
-    print(f"Using latest checkpoint: {highest_epoch}")
+    # Setup HF upload directory
+    hf_upload_dir = os.path.join("output", "wan_train_replicate")
+    captions_dir = os.path.join(hf_upload_dir, "captions")
     
-    if not os.path.exists(os.path.join(adapter_dir, "adapter_model.safetensors")):
-        raise ValueError(f"No adapter model found at {adapter_dir}")
+    # Clear and recreate directory
+    if os.path.exists(hf_upload_dir):
+        shutil.rmtree(hf_upload_dir)
     
-    # Create directory structure to exactly match the example
-    # First, create a temporary directory with the exact structure we want
-    temp_root = "temp_output_dir"
-    if os.path.exists(temp_root):
-        shutil.rmtree(temp_root)
-    
-    # Create the example directory structure
-    example_output_dir = os.path.join(temp_root, "output")
-    example_job_dir = os.path.join(example_output_dir, "wan_train_replicate")
-    captions_dir = os.path.join(example_job_dir, "captions")
-    
-    # Create all directories
     os.makedirs(captions_dir, exist_ok=True)
     
-    # Determine the model type from the config file
+    # Get model type from config
     with open("wan_train_replicate.toml", "r") as f:
         config = toml.load(f)
     
-    # Extract model type from path
     model_path = config['model']['ckpt_path']
     model_type = "1.3b" if "1.3B" in model_path else "14b"
     is_i2v = "I2V" in model_path
     
-    # Create appropriate filename based on type
-    if is_i2v:
-        lora_filename = f"{model_type}-i2v-lora.safetensors"
-    else:
-        lora_filename = f"{model_type}-lora.safetensors"
+    # Create appropriate filename
+    lora_filename = f"{model_type}-{'i2v' if is_i2v else 'lora'}.safetensors"
     
-    # Copy and rename the safetensors file
-    print(f"Copying adapter model to output structure as {lora_filename}")
+    # Copy safetensors file
     shutil.copy(
         os.path.join(adapter_dir, "adapter_model.safetensors"),
-        os.path.join(example_job_dir, lora_filename)
+        os.path.join(hf_upload_dir, lora_filename)
     )
     
-    # Copy caption files
+    # Copy captions
     caption_files = list(Path(INPUT_DIR).glob("wan_train_replicate/**/*.txt"))
-    print(f"Adding {len(caption_files)} caption files to archive")
     for caption_file in caption_files:
         shutil.copy(caption_file, captions_dir)
     
-    # Create the tar archive using the temp structure
+    # Create tar archive
     output_path = "trained_model.tar"
-    print(f"Creating final archive at {output_path}")
-    os.system(f"tar -cvf {output_path} -C {temp_root} output")
+    with tarfile.open(output_path, "w") as tar:
+        tar.add(hf_upload_dir, arcname=os.path.basename(hf_upload_dir))
     
-    # Create a persistent directory for HF uploads with the same content
-    # This ensures we have a directory to upload even after the temp dir is cleaned up
-    hf_upload_dir = os.path.join("output", "wan_train_replicate")
-    os.makedirs(os.path.dirname(hf_upload_dir), exist_ok=True)
-    
-    # Copy directory to output/ for HF upload
-    if os.path.exists(hf_upload_dir):
-        shutil.rmtree(hf_upload_dir)
-    shutil.copytree(example_job_dir, hf_upload_dir)
-    
-    # Clean up temp directory after tar is created
-    shutil.rmtree(temp_root)
-    
-    # Verify the file exists
-    if os.path.exists(output_path):
-        file_size_mb = os.path.getsize(output_path) / (1024*1024)
-        print(f"✅ Archive created successfully")
-        print(f"  • Path: {output_path}")
-        print(f"  • Size: {file_size_mb:.2f} MB")
-        print(f"  • LoRA: {lora_filename}")
-    else:
-        print(f"⚠️ WARNING: Output file not found at {output_path}")
-    
-    print("=====================================")
+    print(f"✅ Archive created at {output_path}")
     
     return output_path
 
