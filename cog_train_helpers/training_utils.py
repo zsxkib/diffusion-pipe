@@ -5,6 +5,8 @@ import subprocess
 import toml
 from pathlib import Path
 import tarfile
+import time
+import re
 
 # Import constants
 from cog_train_helpers.constants import INPUT_DIR, OUTPUT_DIR, QWEN_MODEL_CACHE
@@ -21,8 +23,8 @@ def clean_up() -> None:
     print("=====================================")
 
 
-def run_training(training_steps: int, num_gpus: int = 1) -> None:
-    """Execute the training process."""
+def run_training(training_steps: int, num_gpus: int = 1, wandb_client=None) -> None:
+    """Execute the training process with optional W&B logging."""
     print("\n=== 🚀 Starting WAN Training ===")
     
     train_cmd = [
@@ -41,14 +43,88 @@ def run_training(training_steps: int, num_gpus: int = 1) -> None:
     print(f"Command: {cmd}")
     print("Starting training process...")
     
-    # Execute the training command
-    process = subprocess.run(cmd, shell=True, check=True)
+    # If W&B is enabled, capture output to extract metrics
+    if wandb_client:
+        # Run with real-time output capture
+        process = subprocess.Popen(
+            cmd, 
+            shell=True, 
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
+
+        # Pattern to extract loss information
+        step_pattern = re.compile(r"steps: (\d+) loss: ([\d\.]+)")
+        sample_pattern = re.compile(r"Generating sample for step (\d+)")
+        save_pattern = re.compile(r"Saving model checkpoint for step (\d+)")
+        
+        # Initialize sample tracking
+        last_sample_check = time.time()
+        sample_check_interval = 60  # Check for new samples every 60 seconds
+        seen_samples = set()
+        current_step = 0
+        
+        # Process output line by line
+        for line in iter(process.stdout.readline, ''):
+            # Print the output to console
+            print(line, end='')
+            
+            # Extract and log loss if available
+            step_match = step_pattern.search(line)
+            if step_match and wandb_client:
+                current_step = int(step_match.group(1))
+                loss = float(step_match.group(2))
+                wandb_client.log_loss({"loss": loss}, current_step)
+            
+            # Check if a sample is being generated (step-based detection)
+            sample_match = sample_pattern.search(line)
+            if sample_match and wandb_client:
+                sample_step = int(sample_match.group(1))
+                print(f"Detected sample generation at step {sample_step}")
+                # We'll check for new samples shortly
+                last_sample_check = 0  # Force immediate sample check
+            
+            # Check if a checkpoint is being saved (step-based detection)
+            save_match = save_pattern.search(line)
+            if save_match and wandb_client:
+                save_step = int(save_match.group(1))
+                print(f"Detected checkpoint saving at step {save_step}")
+                # We'll handle the checkpoint upload separately at the end
+            
+            # Periodically check for samples (time-based detection as backup)
+            if wandb_client and (time.time() - last_sample_check > sample_check_interval):
+                last_sample_check = time.time()
+                output_dir = os.path.join(OUTPUT_DIR, "samples")
+                
+                if os.path.exists(output_dir):
+                    all_samples = set()
+                    for ext in ['mp4', 'gif', 'png', 'jpg', 'jpeg']:
+                        for sample_file in Path(output_dir).glob(f"*.{ext}"):
+                            all_samples.add(str(sample_file))
+                    
+                    # Find new samples
+                    new_samples = all_samples - seen_samples
+                    if new_samples:
+                        sample_paths = [Path(p) for p in sorted(new_samples)]
+                        print(f"Found {len(new_samples)} new samples to log to W&B")
+                        wandb_client.log_samples(sample_paths, current_step)
+                        seen_samples.update(new_samples)
+        
+        # Wait for process to complete
+        process.wait()
+        return_code = process.returncode
+    else:
+        # If W&B not enabled, just run normally
+        process = subprocess.run(cmd, shell=True, check=True)
+        return_code = process.returncode
     
     # Verify training completed successfully
-    if process.returncode == 0:
+    if return_code == 0:
         print("✅ Training completed successfully!")
     else:
-        print(f"⚠️ Training exited with code: {process.returncode}")
+        print(f"⚠️ Training exited with code: {return_code}")
     
     print("=====================================")
 

@@ -52,7 +52,9 @@ def create_config_toml(
     warmup_steps: int,
     weight_decay: float,
     seed: int,
-    num_gpus: int = 1
+    num_gpus: int = 1,
+    wandb_sample_interval: int = None,
+    wandb_save_interval: int = None
 ) -> None:
     """Create training configuration file with specified parameters."""
     print("\n=== 📝 Creating Training Configuration ===")
@@ -117,6 +119,22 @@ def create_config_toml(
             "train_micro_batch_size_per_gpu": 1
         }
     }
+    
+    # Add sample_every if W&B sample interval is provided
+    if wandb_sample_interval:
+        # Create the sample section if it doesn't exist
+        if "sample" not in config:
+            config["sample"] = {}
+        config["sample"]["sample_every"] = wandb_sample_interval
+        print(f"  • Sample visualization every {wandb_sample_interval} steps")
+    
+    # Add save_every if W&B save interval is provided
+    if wandb_save_interval:
+        # Create the save section if it doesn't exist
+        if "save" not in config:
+            config["save"] = {}
+        config["save"]["save_every"] = wandb_save_interval
+        print(f"  • Model checkpoint saved every {wandb_save_interval} steps")
     
     with open("wan_train_replicate.toml", "w") as f:
         toml.dump(config, f)

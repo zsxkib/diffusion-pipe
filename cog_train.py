@@ -22,7 +22,7 @@ import toml
 from pathlib import Path
 from zipfile import ZipFile, is_zipfile
 from cog import BaseModel, Input, Path as CogPath, Secret  # Added Secret import
-from typing import Optional
+from typing import Optional, List
 import logging
 import torch
 import av
@@ -40,6 +40,7 @@ from cog_train_helpers.hf_utils import (
     handle_hf_readme,
     create_model_card_metadata
 )
+from wandb_client import WeightsAndBiasesClient, logout_wandb
 
 # Configure logging to suppress INFO messages
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
@@ -76,7 +77,7 @@ def train(
     ),
     finetuning_type: str = Input(
         description="Choose training mode: 'text2video' learns to generate videos from text descriptions, 'image2video' learns to extend the first frame of a video into motion (requires 14B model).",
-        default="text2video",
+        default="image2video",
         choices=["text2video", "image2video"],
     ),
     video_clip_mode: str = Input(
@@ -140,18 +141,52 @@ def train(
         description="Random seed for training reproducibility. Use -1 for a random seed.",
         default=-1,
     ),
-    hf_repo_id: str = Input(
+    # Hugging Face parameters
+    hf_repo_id: Optional[str] = Input(
         description="Hugging Face repository ID, if you'd like to upload the trained LoRA to Hugging Face. For example, username/wan-lora. If the given repo does not exist, a new public repo will be created.",
         default=None,
     ),
-    hf_token: Secret = Input(
+    hf_token: Optional[Secret] = Input(
         description="Hugging Face token, if you'd like to upload the trained LoRA to Hugging Face.",
         default=None,
+    ),
+    # Weights & Biases parameters
+    wandb_api_key: Optional[Secret] = Input(
+        description="Weights and Biases API key for experiment tracking. If provided, training progress will be logged to W&B.",
+        default=None,
+    ),
+    wandb_project: str = Input(
+        description="Weights and Biases project name. A new project will be created if it doesn't exist.",
+        default="wan_train_replicate",
+    ),
+    wandb_run: Optional[str] = Input(
+        description="Weights and Biases run name. If not provided, a random name will be generated.",
+        default=None,
+    ),
+    wandb_entity: Optional[str] = Input(
+        description="Weights and Biases entity (username or organization). If not provided, will use your default entity.",
+        default=None,
+    ),
+    wandb_sample_prompts: Optional[str] = Input(
+        description="Newline-separated list of prompts to use for sample generation. These will be logged to W&B with your trigger word.",
+        default=None,
+    ),
+    wandb_sample_interval: int = Input(
+        description="Step interval for sampling output videos to W&B",
+        default=250,
+        ge=1,
+    ),
+    wandb_save_interval: int = Input(
+        description="Step interval for saving checkpoints to W&B",
+        default=500,
+        ge=1,
     ),
 ) -> TrainingOutput:
     """
     Train a WAN model adapter on your video using LoRA fine-tuning.
     """
+    # Ensure clean environment
+    logout_wandb()
 
     # If warmup_steps_budget not provided or -1, default to 10% of max_training_steps
     if warmup_steps_budget is None or warmup_steps_budget == -1:
@@ -196,6 +231,13 @@ def train(
     if hf_repo_id:
         print(f"  • Hugging Face Upload:")
         print(f"    - Repository: {hf_repo_id}")
+    if wandb_api_key:
+        print(f"  • Weights & Biases:")
+        print(f"    - Project: {wandb_project}")
+        if wandb_entity:
+            print(f"    - Entity: {wandb_entity}")
+        if wandb_run:
+            print(f"    - Run Name: {wandb_run}")
     print("=====================================\n")
 
     if not input_video_zip:
@@ -207,6 +249,43 @@ def train(
     # Setup directories and seed
     clean_up()
     seed = handle_seed(seed)
+    
+    # ===== WEIGHTS & BIASES SETUP =====
+    wandb_client = None
+    if wandb_api_key:
+        # Parse sample prompts
+        sample_prompts = []
+        if wandb_sample_prompts:
+            sample_prompts = [p.strip() for p in wandb_sample_prompts.split("\n")]
+            # Add trigger word if needed
+            sample_prompts = [
+                f"{p}, {trigger_word}" if trigger_word not in p else p
+                for p in sample_prompts
+            ]
+        
+        # Basic config for W&B
+        wandb_config = {
+            "trigger_word": trigger_word,
+            "model_type": model_type,
+            "finetuning_type": finetuning_type,
+            "steps": max_training_steps,
+            "learning_rate": learning_rate,
+            "lora_rank": lora_rank,
+        }
+        
+        # Initialize W&B
+        try:
+            wandb_client = WeightsAndBiasesClient(
+                api_key=wandb_api_key.get_secret_value(),
+                config=wandb_config,
+                project=wandb_project,
+                entity=wandb_entity,
+                name=wandb_run,
+                sample_prompts=sample_prompts,
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to initialize W&B: {str(e)}")
+            wandb_client = None
     
     # Download the model with specified type
     download_model(model_type, finetuning_type)
@@ -237,11 +316,21 @@ def train(
         warmup_steps=warmup_steps_budget,
         weight_decay=weight_decay,
         seed=seed,
-        num_gpus=num_gpus
+        num_gpus=num_gpus,
+        wandb_sample_interval=wandb_sample_interval if wandb_api_key else None,
+        wandb_save_interval=wandb_save_interval if wandb_api_key else None
     )
     
-    # Run training - pass max_training_steps to force a hard stop
-    run_training(max_training_steps, num_gpus)
+    # Configure W&B environment if needed
+    if wandb_api_key:
+        os.environ["WANDB_API_KEY"] = wandb_api_key.get_secret_value()
+        if wandb_project:
+            os.environ["WANDB_PROJECT"] = wandb_project
+        if wandb_entity:
+            os.environ["WANDB_ENTITY"] = wandb_entity
+    
+    # Run training with W&B client if enabled
+    run_training(max_training_steps, num_gpus, wandb_client)
     
     # Archive results
     output_path = archive_results()
@@ -283,15 +372,32 @@ def train(
                     token=hf_token.get_secret_value()
                 )
                 
-                # Upload the folder
+                # Upload the folder, ignoring .github directories
                 api.upload_folder(
                     repo_id=hf_repo_id,
                     folder_path=job_dir,
                     repo_type="model",
-                    token=hf_token.get_secret_value()
+                    token=hf_token.get_secret_value(),
+                    ignore_patterns=".github/**"
                 )
                 
                 print(f"🎉 Model uploaded to Hugging Face: {repo_url}")
+                
+                # Log HF repo to W&B if available
+                if wandb_client:
+                    wandb_client.run.config.update({"hf_repo_url": repo_url})
+    
+    # Save final weights to W&B and finish
+    if wandb_client:
+        # Save the final model weights
+        job_dir = os.path.join("output", "wan_train_replicate")
+        safetensors_files = [f for f in os.listdir(job_dir) if f.endswith('.safetensors')]
+        if safetensors_files:
+            weights_path = os.path.join(job_dir, safetensors_files[0])
+            wandb_client.save_weights(weights_path)
+        
+        # Finish W&B run
+        wandb_client.finish()
     
     print("\n=== 🎉 Training Complete! ===")
     print(f"  • Trained model saved to: {output_path}")
@@ -300,6 +406,8 @@ def train(
         print(f"  • Your model has been uploaded to Hugging Face: {repo_url}")
     elif hf_repo_id and hf_token:
         print(f"  • Attempted to upload to Hugging Face: {hf_repo_id}, but there was an error")
+    if wandb_client:
+        print(f"  • Training logs available in Weights & Biases: {wandb_client.run.get_url()}")
     print("=====================================")
     
     return TrainingOutput(weights=CogPath(output_path))
