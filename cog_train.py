@@ -77,7 +77,7 @@ def train(
     ),
     finetuning_type: str = Input(
         description="Choose training mode: 'text2video' learns to generate videos from text descriptions, 'image2video' learns to extend the first frame of a video into motion (requires 14B model).",
-        default="text2video",
+        default="image2video",
         choices=["text2video", "image2video"],
     ),
     video_clip_mode: str = Input(
