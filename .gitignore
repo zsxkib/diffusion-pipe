@@ -163,6 +163,7 @@ cython_debug/
 
 # Replicate
 /output_wan/*
+/output/*
 /model_cache/*
 /data/*
 *.mp4

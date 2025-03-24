@@ -18,4 +18,5 @@ __pycache__
 
 # Replicate
 /output_wan/*
+/output/*
 /model_cache/*

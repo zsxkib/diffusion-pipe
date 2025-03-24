@@ -38,7 +38,6 @@ from cog_train_helpers.training_utils import clean_up, run_training, archive_res
 from cog_train_helpers.hf_utils import (
     handle_hf_lora_filename,
     handle_hf_readme,
-    upload_to_huggingface,
     create_model_card_metadata
 )
 
@@ -249,99 +248,67 @@ def train(
     
     # Upload to Hugging Face if requested
     if hf_repo_id and hf_token:
-        # Extract the compressed files to a temporary directory for uploading
-        temp_extract_dir = os.path.join(OUTPUT_DIR, "hf_upload")
-        os.makedirs(temp_extract_dir, exist_ok=True)
+        # The directory we prepared for HF upload in archive_results
+        job_dir = os.path.join("output", "wan_train_replicate")
         
-        # Extract the tar file
-        subprocess.run(["tar", "-xf", output_path, "-C", temp_extract_dir], check=True)
-        
-        # Find the extracted output directory
-        extracted_dirs = [d for d in os.listdir(temp_extract_dir) if os.path.isdir(os.path.join(temp_extract_dir, d))]
-        if not extracted_dirs:
-            print("⚠️ Could not find extracted model directory for HF upload")
+        if not os.path.exists(job_dir):
+            print(f"⚠️ Training output directory not found: {job_dir}")
         else:
-            extract_path = os.path.join(temp_extract_dir, extracted_dirs[0])
-            
-            # Get model file path and determine best name
-            lora_files = [f for f in os.listdir(extract_path) if f.endswith('.safetensors')]
-            if not lora_files:
-                print("⚠️ Could not find LoRA model file for HF upload")
+            # Find the safetensors file
+            safetensors_files = [f for f in os.listdir(job_dir) if f.endswith('.safetensors')]
+            if not safetensors_files:
+                print("⚠️ No safetensors file found in training output.")
             else:
-                # Create a suitable filename for HF
-                old_lora_file = lora_files[0]
-                new_lora_file = handle_hf_lora_filename(
-                    trigger_word=trigger_word, 
-                    model_type=model_type,
-                    finetuning_type=finetuning_type,
-                    repo_id=hf_repo_id
-                )
-                
-                # Rename the file to the standardized name
+                # Rename to a standardized name
+                old_lora_file = safetensors_files[0]
+                new_lora_file = handle_hf_lora_filename(trigger_word, hf_repo_id)
                 os.rename(
-                    os.path.join(extract_path, old_lora_file),
-                    os.path.join(extract_path, new_lora_file)
+                    os.path.join(job_dir, old_lora_file),
+                    os.path.join(job_dir, new_lora_file)
                 )
                 
                 # Create README
                 handle_hf_readme(
                     hf_repo_id=hf_repo_id,
                     trigger_word=trigger_word,
-                    model_type=model_type,
-                    finetuning_type=finetuning_type,
-                    max_training_steps=max_training_steps,
+                    steps=max_training_steps,
                     learning_rate=learning_rate,
                     lora_rank=lora_rank,
-                    lora_filename=new_lora_file,
-                    output_dir=OUTPUT_DIR
-                )
-                
-                # Create model card metadata
-                create_model_card_metadata(
-                    hf_repo_id=hf_repo_id,
-                    model_type=model_type,
-                    finetuning_type=finetuning_type,
-                    trigger_word=trigger_word,
-                    output_dir=OUTPUT_DIR
-                )
-                
-                # Copy files to the upload directory
-                shutil.copy(
-                    os.path.join(OUTPUT_DIR, "README.md"),
-                    os.path.join(extract_path, "README.md")
-                )
-                
-                # Copy metadata files if they exist
-                metadata_dir = os.path.join(OUTPUT_DIR, ".github")
-                if os.path.exists(metadata_dir):
-                    target_metadata_dir = os.path.join(extract_path, ".github")
-                    os.makedirs(target_metadata_dir, exist_ok=True)
-                    
-                    # Copy model-card.json
-                    if os.path.exists(os.path.join(metadata_dir, "model-card.json")):
-                        shutil.copy(
-                            os.path.join(metadata_dir, "model-card.json"),
-                            os.path.join(target_metadata_dir, "model-card.json")
-                        )
-                
-                # Upload to HF
-                repo_url = upload_to_huggingface(
-                    hf_repo_id=hf_repo_id,
-                    hf_token=hf_token.get_secret_value(),
-                    output_dir=extract_path,
                     lora_filename=new_lora_file
                 )
                 
-                if repo_url:
-                    print(f"🎉 Your model has been successfully uploaded to Hugging Face!")
-                    print(f"   View it at: {repo_url}")
+                # Upload to HF
+                print(f"Uploading to Hugging Face: {hf_repo_id}")
+                api = HfApi()
+                repo_url = api.create_repo(
+                    hf_repo_id,
+                    private=False,
+                    exist_ok=True,
+                    token=hf_token.get_secret_value()
+                )
+                
+                # Copy the README template to the upload directory if it exists
+                template_path = "hugging-face-readme-template.md"
+                if os.path.exists(template_path):
+                    shutil.copy(template_path, job_dir)
+                
+                # Upload the entire folder
+                api.upload_folder(
+                    repo_id=hf_repo_id,
+                    folder_path=job_dir,
+                    repo_type="model",
+                    token=hf_token.get_secret_value()
+                )
+                
+                print(f"🎉 Model uploaded to Hugging Face: {repo_url}")
     
     print("\n=== 🎉 Training Complete! ===")
     print(f"  • Trained model saved to: {output_path}")
     print(f"  • You can now use your WAN LoRA with trigger word: '{trigger_word}'")
-    if hf_repo_id and hf_token:
-        print(f"  • Your model has been uploaded to Hugging Face: {hf_repo_id}")
-    print("=====================================\n")
+    if hf_repo_id and hf_token and 'repo_url' in locals() and repo_url:
+        print(f"  • Your model has been uploaded to Hugging Face: {repo_url}")
+    elif hf_repo_id and hf_token:
+        print(f"  • Attempted to upload to Hugging Face: {hf_repo_id}, but there was an error")
+    print("=====================================")
     
-    # Return the path to the trained weights
     return TrainingOutput(weights=CogPath(output_path))

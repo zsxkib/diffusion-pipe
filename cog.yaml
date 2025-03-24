@@ -33,6 +33,7 @@ build:
     - "ftfy"
     - "imageio[pyav]"
     - "albumentations==1.4.3"
+    - "hf-transfer"
 
     # for Qwen
     # - "torch==2.1.2"

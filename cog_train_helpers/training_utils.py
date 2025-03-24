@@ -52,21 +52,20 @@ def run_training(training_steps: int, num_gpus: int = 1) -> None:
     print("=====================================")
 
 
-def archive_results() -> str:
-    """Package training results and return path to archive."""
+def archive_results():
+    """Archive the training results into a tar file."""
     print("\n=== 📦 Archiving Results ===")
-    output_path = "trained_model.tar" 
     
-    # Find the most recent training directory
-    subdirs = sorted([d for d in os.listdir(OUTPUT_DIR) if os.path.isdir(os.path.join(OUTPUT_DIR, d))])
+    # Find the latest training directory
+    training_dirs = sorted([d for d in os.listdir(OUTPUT_DIR) if os.path.isdir(os.path.join(OUTPUT_DIR, d))])
     
-    if not subdirs:
+    if not training_dirs:
         raise ValueError(f"No training directories found in {OUTPUT_DIR}")
     
-    latest_dir = os.path.join(OUTPUT_DIR, subdirs[-1])
+    latest_dir = os.path.join(OUTPUT_DIR, training_dirs[-1])
     print(f"Found training directory: {latest_dir}")
     
-    # Find the latest checkpoint (epoch) directory
+    # Find all epoch directories
     epoch_dirs = [d for d in os.listdir(latest_dir) if d.startswith("epoch")]
     
     if not epoch_dirs:
@@ -124,8 +123,19 @@ def archive_results() -> str:
         shutil.copy(caption_file, captions_dir)
     
     # Create the tar archive using the temp structure
+    output_path = "trained_model.tar"
     print(f"Creating final archive at {output_path}")
     os.system(f"tar -cvf {output_path} -C {temp_root} output")
+    
+    # Create a persistent directory for HF uploads with the same content
+    # This ensures we have a directory to upload even after the temp dir is cleaned up
+    hf_upload_dir = os.path.join("output", "wan_train_replicate")
+    os.makedirs(os.path.dirname(hf_upload_dir), exist_ok=True)
+    
+    # Copy directory to output/ for HF upload
+    if os.path.exists(hf_upload_dir):
+        shutil.rmtree(hf_upload_dir)
+    shutil.copytree(example_job_dir, hf_upload_dir)
     
     # Clean up temp directory after tar is created
     shutil.rmtree(temp_root)
